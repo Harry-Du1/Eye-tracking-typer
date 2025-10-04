@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Eye & Head Combined Gaze (face-landmarks-detection@1.0.6)</title>
+  <style>
+    :root{ --bg:#0b1220; --panel:#121a2a; --text:#e6eefb; --accent:#7cc0ff; --good:#7CFF9C; }
+    html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+    #overlay{ position:fixed; inset:0; pointer-events:none; z-index:9999; }
+    #cursor{ position:fixed; width:18px; height:18px; margin:-9px 0 0 -9px; border-radius:999px; background:var(--accent); box-shadow:0 0 0 4px rgba(124,192,255,.25); }
+    #ring,#ringFill{ position:fixed; width:42px; height:42px; margin:-21px 0 0 -21px; border-radius:999px; }
+    #ring{border:3px solid rgba(255,255,255,.15)} #ringFill{box-shadow:0 0 0 3px var(--good) inset; clip-path: conic-gradient(var(--good) 0deg, transparent 0deg)}
+    .calibDot{ position:absolute; width:18px; height:18px; margin:-9px 0 0 -9px; border-radius:50%; background:#FFD37C; box-shadow:0 0 0 6px rgba(255,211,124,.2) }
+    #keyboard{ position:fixed; left:0; right:0; bottom:0; background:#0f172a; border-top:1px solid #1f2a42; display:grid; grid-template-columns:repeat(10,1fr); gap:8px; padding:12px; }
+    .key{ user-select:none; display:flex; align-items:center; justify-content:center; height:56px; border-radius:12px; background:#16203a; color:#cfe3ff; border:1px solid #263a6b; font-weight:600 }
+    .key.big{grid-column:span 2}.key.extra{grid-column:span 3}.key.active{outline:2px solid var(--accent)}
+    #status{ position:fixed; right:12px; top:12px; background:#121a2a; border:1px solid #203059; padding:8px 10px; border-radius:8px; z-index:10000}
+    canvas{display:none}
+  </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@1.0.6/dist/face-landmarks-detection.min.js"></script>
+</head>
+<body>
+  <video id="cam" autoplay playsinline></video>
+  <canvas id="proc" width="640" height="480"></canvas>
+
+  <div id="overlay">
+    <div id="cursor"></div>
+    <div id="ring"></div>
+    <div id="ringFill"></div>
+  </div>
+  <div id="keyboard"></div>
+  <div id="status">Status: <span id="statTxt">loading model…</span></div>
+
+  <script type="module">
+  const cam = document.getElementById('cam');
+  const proc = document.getElementById('proc');
+  const ctx  = proc.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const cursor = document.getElementById('cursor');
+  const ring = document.getElementById('ring');
+  const ringFill = document.getElementById('ringFill');
+  const statTxt = document.getElementById('statTxt');
+  const keyboard = document.getElementById('keyboard');
+
+  /* ---------- keyboard ---------- */
+  const LAYOUT = ['QWERTYUIOP','ASDFGHJKL','ZXCVBNM'];
+  function buildKeyboard(){
+    keyboard.innerHTML='';
+    for(const ch of LAYOUT[0]) addKey(ch);
+    const spacer = document.createElement('div'); spacer.style.opacity=0; keyboard.appendChild(spacer);
+    for(const ch of LAYOUT[1]) addKey(ch);
+    const spacer2 = document.createElement('div'); spacer2.style.opacity=0; keyboard.appendChild(spacer2);
+    for(const ch of LAYOUT[2]) addKey(ch);
+    addKey('SPACE','extra'); addKey('BKSP','big'); addKey('ENTER','big');
+  }
+  function addKey(label, cls=''){ const d=document.createElement('div'); d.className='key '+cls; d.dataset.label=label; d.textContent=label; keyboard.appendChild(d); }
+  buildKeyboard();
+
+  const wait = (ms)=> new Promise(r=>setTimeout(r,ms));
+  function centroid(pts){ let sx=0, sy=0; const n=pts.length||1; for(const p of pts){ sx+=p.x; sy+=p.y; } return {x:sx/n, y:sy/n}; }
+  function centroidArr(pts){ let sx=0, sy=0; const n=pts.length||1; for(const p of pts){ sx+=p[0]; sy+=p[1]; } return [sx/n, sy/n]; }
+  function dist2(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+  function setCursor(x,y,p=0){
+    cursor.style.left=x+'px'; cursor.style.top=y+'px';
+    ring.style.left=x+'px'; ring.style.top=y+'px';
+    ringFill.style.left=x+'px'; ringFill.style.top=y+'px';
+    ringFill.style.clipPath = `conic-gradient(var(--good) ${Math.round(p*360)}deg, transparent 0deg)`;
+  }
+
+  const DWELL_MS = 500, SNAP_RADIUS = 28;
+  let hoverKey = null, hoverStart = 0;
+  function findNearestKey(x,y,R){
+    let best=null, bestD=Infinity;
+    for(const k of document.querySelectorAll('.key')){
+      const r=k.getBoundingClientRect(); const cx=(r.left+r.right)/2, cy=(r.top+r.bottom)/2;
+      const d=Math.hypot(x-cx,y-cy); if(d<bestD){bestD=d; best=k;}
+    }
+    return bestD<=R?best:null;
+  }
+  function selectKey(k){
+    const label=k.dataset.label;
+    if(label==='SPACE') console.log('[SPACE]');
+    else if(label==='BKSP') console.log('[BKSP]');
+    else if(label==='ENTER') console.log('[ENTER]');
+    else console.log(label);
+  }
+
+  function updateDwell(xs, ys){
+    const nearest = findNearestKey(xs, ys, SNAP_RADIUS);
+    if (nearest !== hoverKey){
+      if(hoverKey) hoverKey.classList.remove('active');
+      hoverKey = nearest; hoverStart = nearest ? performance.now() : 0;
+      setCursor(xs, ys, 0);
+      if(hoverKey) hoverKey.classList.add('active');
+      return;
+    }
+    if (!hoverKey) return;
+    const p = Math.min(1, (performance.now()-hoverStart)/DWELL_MS);
+    setCursor(xs, ys, p);
+    if (p >= 1){ selectKey(hoverKey); hoverKey.classList.remove('active'); hoverKey = null; hoverStart = 0; setCursor(xs, ys, 0); }
+  }
+
+  class OneEuro {
+    constructor(minCutoff=1.0, beta=0.006, dCutoff=1.0, freq=60){
+      this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=dCutoff; this.freq=freq;
+      this.xPrev=null; this.dxPrev=0; this.tPrev=null;
+    }
+    alpha(cutoff){ const te=1.0/this.freq; const r=2*Math.PI*cutoff*te; return r/(r+1); }
+    update([x,y]){
+      const now=performance.now();
+      const dt=this.tPrev? (now-this.tPrev)/1000 : 1/this.freq; this.tPrev=now;
+      const aD=this.alpha(this.dCutoff);
+      const dx = this.xPrev? Math.hypot(x-this.xPrev[0], y-this.xPrev[1]) / dt : 0;
+      const dxHat = aD*dx + (1-aD)*this.dxPrev; this.dxPrev=dxHat;
+      const cutoff = this.minCutoff + this.beta*dxHat;
+      const a = this.alpha(cutoff);
+      const xHat = this.xPrev? [ a*x + (1-a)*this.xPrev[0], a*y + (1-a)*this.xPrev[1] ] : [x,y];
+      this.xPrev = xHat; return xHat;
+    }
+  }
+  const filter = new OneEuro(1.0, 0.006, 1.0, 60);
+
+  const calibPairs = []; 
+  const targets = [[0.1,0.1],[0.5,0.1],[0.9,0.1],[0.1,0.5],[0.5,0.5],[0.9,0.5],[0.1,0.9],[0.5,0.9],[0.9,0.9]];
+  const margin = 40;
+  function pxX(tx){ return margin + tx*(window.innerWidth-2*margin); }
+  function pxY(ty){ return margin + ty*(window.innerHeight-2*margin); }
+  function showDotAt(tx,ty){
+    const x=pxX(tx), y=pxY(ty);
+    const d=document.createElement('div'); d.className='calibDot';
+    d.style.left=x+'px'; d.style.top=y+'px'; overlay.appendChild(d);
+    return {x,y,el:d};
+  }
+  let theta=null; 
+  function phi(u){ const [a,b]=u; return [1,a,b,a*a,a*b,b*b]; }
+  function fitMapping(pairs){
+    const Phi = pairs.map(p=>phi(p.u)), Y = pairs.map(p=>p.v);
+    const d=6, m=Phi.length, A=Array.from({length:d},()=>Array(d).fill(0)), B=Array.from({length:d},()=>Array(2).fill(0));
+    for(let i=0;i<m;i++){ const ph=Phi[i], y=Y[i];
+      for(let r=0;r<d;r++){ for(let c=0;c<d;c++) A[r][c]+= ph[r]*ph[c]; B[r][0]+= ph[r]*y[0]; B[r][1]+= ph[r]*y[1]; } }
+    function solve(col){ const n=d, M=A.map((row,i)=>row.slice().concat(B[i][col]));
+      for(let i=0;i<n;i++){ let piv=i; for(let r=i+1;r<n;r++) if(Math.abs(M[r][i])>Math.abs(M[piv][i])) piv=r;
+        [M[i],M[piv]]=[M[piv],M[i]]; const div=M[i][i]||1e-9; for(let c=i;c<=n;c++) M[i][c]/=div;
+        for(let r=0;r<n;r++){ if(r===i) continue; const f=M[r][i]; for(let c=i;c<=n;c++) M[r][c]-=f*M[i][c]; } }
+      return M.map(row=>row[n]); }
+    theta=[solve(0), solve(1)]; localStorage.setItem('calibTheta', JSON.stringify(theta));
+  }
+  function mapToScreen(u){
+    if(!theta){ const cx=innerWidth*0.5, cy=innerHeight*0.5; return [cx + u[0]*220, cy + u[1]*220]; }
+    const p=phi(u); const x=p.reduce((s,v,i)=>s+v*theta[0][i],0), y=p.reduce((s,v,i)=>s+v*theta[1][i],0); return [x,y];
+  }
+  async function runCalibration(){
+    statTxt.textContent='calibrating…';
+    const samplesPerPoint=30, dt=60;
+    for(const [tx,ty] of targets){
+      const dot=showDotAt(tx,ty); await wait(400);
+      for(let i=0;i<samplesPerPoint;i++){ if(lastU) calibPairs.push({u:lastU.slice(), v:[dot.x,dot.y]}); await wait(dt); }
+      dot.el.remove(); await wait(120);
+    }
+    fitMapping(calibPairs); statTxt.textContent='running (calibrated ✓)'; localStorage.setItem('calibrated','1');
+  }
+  window.addEventListener('keydown', e=>{ if(e.key==='c') runCalibration(); });
+
+  /* ---------- detector---------- */
+  let detector=null;
+  async function loadDetector(){
+    detector = await faceLandmarksDetection.createDetector(
+      faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh,
+      {
+        runtime: 'tfjs',  
+        refineLandmarks: true, 
+        maxFaces: 1
+      }
+    );
+  }
+
+  function pick(kps, ...substrs){
+    const subs = substrs.map(s=>s.toLowerCase());
+    return kps.filter(p => p.name && subs.every(s => p.name.toLowerCase().includes(s)));
+  }
+  function fallbackEyeSets(kps, isLeft){
+    const side = isLeft ? 'left' : 'right';
+    const up = pick(kps, side,'eye','upper');
+    const low= pick(kps, side,'eye','lower');
+    let all = up.concat(low); if(!all.length) all = pick(kps, side,'eye');
+    let outer = pick(kps, side,'eye','outer')[0];
+    let inner = pick(kps, side,'eye','inner')[0];
+    if(!outer || !inner){
+      if(all.length){
+        const byX = [...all].sort((a,b)=>a.x-b.x);
+        outer = isLeft ? byX[0] : byX[byX.length-1];
+        inner = isLeft ? byX[byX.length-1] : byX[0];
+      }
+    }
+    return {upper:up, lower:low, all, outer, inner};
+  }
+  function eyeIrisCenter(kps, isLeft){
+    const side = isLeft ? 'left' : 'right';
+    const iris = pick(kps, side,'iris');
+    if(iris.length) return centroid(iris);
+    const sets = fallbackEyeSets(kps, isLeft);
+    const upC = sets.upper.length? centroid(sets.upper): centroid(sets.all);
+    const loC = sets.lower.length? centroid(sets.lower): centroid(sets.all);
+    return {x:(upC.x+loC.x)/2, y:(upC.y+loC.y)/2};
+  }
+  function eyeGeom(kps, isLeft){
+    const sets = fallbackEyeSets(kps, isLeft);
+    const mid = {x:(sets.outer.x+sets.inner.x)/2, y:(sets.outer.y+sets.inner.y)/2};
+    const w = Math.hypot(sets.outer.x-sets.inner.x, sets.outer.y-sets.inner.y) + 1e-6;
+    const upC = sets.upper.length? centroid(sets.upper): centroid(sets.all);
+    const loC = sets.lower.length? centroid(sets.lower): centroid(sets.all);
+    const midY = (upC.y + loC.y)/2;
+    const h = Math.abs(upC.y - loC.y) + 1e-6;
+    return {mid, w, midY, h};
+  }
+  function faceRefs(kps){
+    const LE = centroid(pick(kps,'left','eye'));
+    const RE = centroid(pick(kps,'right','eye'));
+    const eyeCenter = {x:(LE.x+RE.x)/2, y:(LE.y+RE.y)/2};
+    const noseTip = pick(kps,'nose','tip')[0] || pick(kps,'nose')[0] || eyeCenter;
+    const sil = pick(kps,'silhouette');
+    let minY=+Infinity, maxY=-Infinity; for(const p of sil){ if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y; }
+    const faceH = (isFinite(minY)&&isFinite(maxY)) ? (maxY-minY) : Math.hypot(RE.x-LE.x, RE.y-LE.y)*1.5;
+    const eyeSpan = Math.hypot(RE.x-LE.x, RE.y-LE.y) + 1e-6;
+    return {eyeCenter, noseTip, faceH, eyeSpan};
+  }
+  const ALPHA = 0.7; // weight for eyes; (1-ALPHA) for head
+  function computeCombinedFeature(kps){
+  // Landmark helper
+  const P = (i) => kps[i] || {x: NaN, y: NaN};
+
+  const R_OUT = 33,  R_IN = 133;
+  // Left eye corners:
+  const L_OUT = 362, L_IN = 263;
+
+  const R_UP = 159, R_LO = 145;  
+  const L_UP = 386, L_LO = 374; 
+
+  const RIGHT_IRIS = [469,470,471,472];
+  const LEFT_IRIS  = [474,475,476,477];
+
+  const N = kps.length;
+  const avg = (idxs) => {
+    let sx=0, sy=0, c=0;
+    for(const i of idxs){ const p=P(i); if(Number.isFinite(p.x)&&Number.isFinite(p.y)){ sx+=p.x; sy+=p.y; c++; } }
+    return c ? {x:sx/c, y:sy/c} : {x:NaN,y:NaN};
+  };
+
+  // Iris (or fallback to eyelid midpoints)
+  const Ri = (N>=478) ? avg(RIGHT_IRIS) : {x:NaN,y:NaN};
+  const Li = (N>=478) ? avg(LEFT_IRIS)  : {x:NaN,y:NaN};
+
+  const Router=P(R_OUT), Rinner=P(R_IN), Louter=P(L_OUT), Linner=P(L_IN);
+  const Rmid = {x:(Router.x+Rinner.x)/2, y:(Router.y+Rinner.y)/2};
+  const Lmid = {x:(Louter.x+Linner.x)/2, y:(Louter.y+Linner.y)/2};
+  const Rw = Math.hypot(Router.x-Rinner.x, Router.y-Rinner.y) + 1e-6;
+  const Lw = Math.hypot(Louter.x-Linner.x, Louter.y-Linner.y) + 1e-6;
+
+  const Rup=P(R_UP), Rlo=P(R_LO), Lup=P(L_UP), Llo=P(L_LO);
+  const RmidY = (Rup.y+Rlo.y)/2, LmidY = (Lup.y+Llo.y)/2;
+  const Rh = Math.abs(Rup.y - Rlo.y) + 1e-6;
+  const Lh = Math.abs(Lup.y - Llo.y) + 1e-6;
+
+  const Rc = Number.isFinite(Ri.x) ? Ri : {x:(Rup.x+Rlo.x)/2, y:(Rup.y+Rlo.y)/2};
+  const Lc = Number.isFinite(Li.x) ? Li : {x:(Lup.x+Llo.x)/2, y:(Lup.y+Llo.y)/2};
+
+  // Eye-only (normalized per-eye, average both)
+  const ux_eye = ((Rc.x - Rmid.x)/Rw + (Lc.x - Lmid.x)/Lw) * 0.5;
+  const uy_eye = ((Rc.y - RmidY)/Rh + (Lc.y - LmidY)/Lh) * 0.5;
+
+  // Head component: nose vs. eye-center
+  const REc = {x:(P(33).x+P(133).x)/2,  y:(P(33).y+P(133).y)/2};
+  const LEc = {x:(P(263).x+P(362).x)/2, y:(P(263).y+P(362).y)/2};
+  const eyeCenter = {x:(REc.x+LEc.x)/2, y:(REc.y+LEc.y)/2};
+  const eyeSpan = Math.hypot(REc.x-LEc.x, REc.y-LEc.y) + 1e-6;
+
+  const nose = P(1); 
+  const minY = kps.reduce((m,p)=>Math.min(m,p.y), Infinity);
+  const maxY = kps.reduce((m,p)=>Math.max(m,p.y), -Infinity);
+  const faceH = Math.max(1e-6, maxY - minY);
+
+  let ux_head = (nose.x - eyeCenter.x)/eyeSpan;
+  let uy_head = (nose.y - eyeCenter.y)/faceH;
+
+  ux_head = -ux_head;
+
+  // Blend eye + head
+  const ALPHA = 0.7; // eye weight
+  const ux = (Number.isFinite(ux_eye) ? ALPHA*ux_eye : 0) + (1-ALPHA)*ux_head;
+  const uy = (Number.isFinite(uy_eye) ? ALPHA*uy_eye : 0) + (1-ALPHA)*uy_head;
+
+  return [ux, uy];
+}
+
+  await navigator.mediaDevices.getUserMedia({video:{facingMode:'user', width:640, height:480}})
+    .then(stream => cam.srcObject = stream);
+  await cam.play();
+  proc.width = cam.videoWidth || 640; proc.height = cam.videoHeight || 480;
+  console.log(`Canvas dimensions set to: ${proc.width}x${proc.height}`);
+
+  await tf.setBackend('webgl');
+  await tf.ready()
+  await loadDetector();
+  statTxt.textContent='running';
+
+  let lastU=[0,0];
+
+  const saved = localStorage.getItem('calibTheta');
+  if(saved){ try{ theta = JSON.parse(saved); statTxt.textContent='running (calibrated ✓)'; }catch{} }
+
+  //ChatGPT debug function.
+  async function tick(){
+    // Log the start of the frame processing
+    console.log("--- TICK START ---"); 
+    
+    try {
+      // 1. Draw the frame
+      ctx.drawImage(cam, 0, 0, proc.width, proc.height);
+      
+      // 2. Estimate Faces
+      const faces = await detector.estimateFaces(cam, { flipHorizontal: true });
+      
+      // Log how many faces were found
+      console.log("Faces Detected:", faces ? faces.length : 0);
+      
+      if (faces && faces.length > 0 && faces[0].keypoints && faces[0].keypoints.length) {
+        const kps = faces[0].keypoints; // [{x,y,z?,name}, ...]
+        
+        // 3. Compute the raw normalized feature
+        const u = computeCombinedFeature(kps); 
+        lastU = u;
+        
+        // Log the raw feature value (u)
+        console.log(`Raw Feature U: [${u[0].toFixed(3)}, ${u[1].toFixed(3)}]`); 
+        
+        // Check for NaN/Infinity in the raw feature (u)
+        if (!Number.isFinite(u[0]) || !Number.isFinite(u[1])) { 
+          console.warn('Feature U is NaN/Infinity. Skipping cursor update.');
+          // Request the next frame and exit this function call
+          requestAnimationFrame(tick); 
+          return; 
+        }
+        
+        // 4. Map the feature to screen coordinates
+        const [x,y] = mapToScreen(u);
+        
+        // 5. Apply the One Euro filter
+        const [xs,ys] = filter.update([x,y]);
+        
+        // Log the coordinates after mapping and filtering
+        console.log(`Mapped Coords: (${x.toFixed(0)}, ${y.toFixed(0)}) | Filtered Coords: (${xs.toFixed(0)}, ${ys.toFixed(0)})`);
+        
+        // Check for NaN/Infinity after filtering
+        if (!Number.isFinite(xs) || !Number.isFinite(ys)) { 
+          console.error('Filtered coordinates are NaN/Infinity. Check OneEuro filter logic.');
+          // Request the next frame and exit this function call
+          requestAnimationFrame(tick); 
+          return; 
+        }
+        
+        // 6. Update the Cursor and Dwell Logic
+        setCursor(xs, ys, hoverKey ? Math.min(1, (performance.now()-hoverStart)/DWELL_MS) : 0);
+        updateDwell(xs, ys);
+
+        // Debug every ~15 frames:
+        // if(((window._f=(window._f||0)+1)%15)===0) console.log('u=', u.map(v=>v.toFixed(3)).join(','));
+      }
+      
+      // If no face was detected, the cursor is not updated, but the loop continues.
+      
+    } catch (error) {
+      // This will catch any errors thrown inside estimateFaces or processing
+      console.error("!!! FATAL TRACKING ERROR IN TICK LOOP !!!", error);
+      statTxt.textContent = 'ERROR: Tracking crashed.';
+      return; // Stop the loop on a fatal crash
+    }
+    
+    // Request the next frame
+    requestAnimationFrame(tick);
+  }
+  
+  // Initial call to start the loop (assuming it's after the successful setup block)
+  requestAnimationFrame(tick);
+
+  window.addEventListener('keydown', e=>{ if(e.key==='c') runCalibration(); });
+  </script>
+</body>
+</html>
