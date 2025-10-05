@@ -9,8 +9,8 @@
   /* ------- THEME & LAYOUT ------- */
   :root{
     --bg:#0b1220; --panel:#121a2a; --text:#e6eefb; --accent:#7cc0ff; --good:#7CFF9C;
-    /* tamaño del preview cuadrado (ajustable) */
-    --preview-size: 26vh;    /* prueba 22–30vh según tu pantalla */
+    /* preview square size (tweakable) */
+    --preview-size: 26vh;    /* try 22–30vh depending on your screen */
     --preview-min: 220px;
     --preview-max: 340px;
   }
@@ -37,7 +37,7 @@
   /* Status pill (top-right) */
   #status{ position:fixed; right:12px; top:12px; background:#121a2a; border:1px solid #203059; padding:8px 10px; border-radius:8px; z-index:10000}
 
-  /* Ocultamos solo los nodos internos; el preview sí es visible */
+  /* Hide only internal nodes; preview stays visible */
   #cam,#proc{display:none}
 
   /* Typed output */
@@ -55,16 +55,16 @@
   /* WebAudio unlock button */
   #soundBtn{ position:fixed; left:12px; top:12px; z-index:10001; background:#16203a; color:#cfe3ff; border:1px solid #263a6b; border-radius:8px; padding:6px 10px; cursor:pointer }
 
-  /* === PREVIEW: cuadrado a la derecha del centro (no tapa el teclado) === */
+  /* === PREVIEW: square to the right of center (doesn't cover keyboard) === */
   #previewDock{
     position: fixed;
-    right: 16px;                /* despega del borde derecho */
-    top: 30%;                   /* ~centro, 30% desde arriba */
+    right: 16px;                /* offset from right edge */
+    top: 30%;                   /* ~center, 30% from top */
     transform: translateY(-50%);
     width: clamp(var(--preview-min), var(--preview-size), var(--preview-max));
     height: clamp(var(--preview-min), var(--preview-size), var(--preview-max));
-    z-index: 2000;              /* por debajo del overlay/cursor, por encima del fondo */
-    pointer-events: none;       /* no bloquea la UI */
+    z-index: 2000;              /* below overlay/cursor, above background */
+    pointer-events: none;       /* does not block UI */
     background:#0b1220;
     border:1px solid #243b6b;
     border-radius:12px;
@@ -76,7 +76,7 @@
     display:block; border-radius:10px; background:#020617;
   }
 
-  /* Ajustes si la pantalla es bajita: encoje el preview para evitar solapes */
+  /* If screen height is small: shrink preview to avoid overlaps */
   @media (max-height: 720px){
     :root{ --preview-size: 24vh; --preview-max: 320px; }
   }
@@ -91,7 +91,7 @@
   <video id="cam" autoplay playsinline muted></video>
   <canvas id="proc" width="640" height="480"></canvas>
 
-  <!-- PREVIEW visible -->
+  <!-- Visible PREVIEW -->
   <div id="previewDock">
     <canvas id="preview" width="320" height="320"></canvas>
   </div>
@@ -138,10 +138,13 @@ let typedBuffer = '';
 function renderTyped(){ typedTextEl.textContent = typedBuffer; }
 const wait = ms=>new Promise(r=>setTimeout(r,ms));
 
-/* ====== OPCIONES DE PREVIEW ====== */
-let SHOW_EYE_TRACKERS = true; // ← dibuja bordes de ojos + iris
+/* ====== PREVIEW OPTIONS ====== */
+let SHOW_EYE_TRACKERS = true; // ← draws eye contours + irises
 
-/* Helpers de dibujo en preview */
+/* ====== CURSOR VERTICAL OFFSET (raises cursor on Y) ====== */
+let GAZE_Y_LIFT_PX = Number(localStorage.getItem('gazeYOffset') || 120);
+
+/* Drawing helpers for preview */
 function drawPoint(ctx,x,y,r=3, color='#7cc0ff'){
   ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2);
   ctx.fillStyle=color; ctx.fill();
@@ -203,7 +206,7 @@ function updatePredictions(){
 }
 
 /* -------------------------------------------------------------
-   4) AUDIO (opcional)
+   4) AUDIO (optional)
    ------------------------------------------------------------- */
 let audioCtx = null;
 soundBtn.addEventListener('click', ()=>{
@@ -229,18 +232,19 @@ function keyClickSound(){ beep(720, 0.06, 0.07); }
 function wordClickSound(){ beep(480, 0.10, 0.09); }
 
 /* -------------------------------------------------------------
-   5) DWELL + SNAP
+   5) DWELL + SNAP (better “grip” onto a key)
    ------------------------------------------------------------- */
-const DWELL_MS = 2000;
+const DWELL_MS = 1000;
 const ENABLE_DWELL_SELECT = true;
-const DWELL_STABILITY_PX = 24;
-const DWELL_RESET_DRIFT_PX = 36;
+const DWELL_STABILITY_PX = 18;   // ↓ stricter = less micro-movement
+const DWELL_RESET_DRIFT_PX = 28; // ↓ easier to restart if you move
 const DWELL_COOLDOWN_MS = 600;
 let dwellCooldownUntil = 0;
 let dwellAnchor = null;
 
 let hoverKey=null, hoverStart=0;
-const SNAP_RADIUS = 20, MAGNET_RADIUS_KEY=80, MAGNET_RADIUS_WORD=140, RELEASE_FACTOR=1.6;
+/* ↑ More “glue” to the key */
+const SNAP_RADIUS = 28, MAGNET_RADIUS_KEY=110, MAGNET_RADIUS_WORD=160, RELEASE_FACTOR=1.3;
 
 function centerDist(el, x, y){
   const r = el.getBoundingClientRect();
@@ -340,27 +344,28 @@ function updateDwell(xs, ys){
 }
 
 /* -------------------------------------------------------------
-   6) FILTER
+   6) FILTERS (smoother and split X/Y)
    ------------------------------------------------------------- */
 class OneEuro {
-  constructor(minCutoff=1.0, beta=0.006, dCutoff=1.0, freq=60){
-    this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=1.0; this.freq=freq;
+  constructor(minCutoff=0.8, beta=0.003, dCutoff=1.0, freq=60){
+    this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=dCutoff; this.freq=freq;
     this.xPrev=null; this.dxPrev=0; this.tPrev=null;
   }
   alpha(cutoff){ const te=1.0/this.freq; const r=2*Math.PI*cutoff*te; return r/(r+1); }
-  update([x,y]){
+  update(x){
     const now=performance.now();
     const dt=this.tPrev? (now-this.tPrev)/1000 : 1/this.freq; this.tPrev=now;
     const aD=this.alpha(this.dCutoff);
-    const dx = this.xPrev? Math.hypot(x-this.xPrev[0], y-this.xPrev[1]) / dt : 0;
+    const dx = (this.xPrev!=null)? Math.abs(x-this.xPrev) / dt : 0;
     const dxHat = aD*dx + (1-aD)*this.dxPrev; this.dxPrev=dxHat;
     const cutoff = this.minCutoff + this.beta*dxHat;
     const a = this.alpha(cutoff);
-    const xHat = this.xPrev? [ a*x + (1-a)*this.xPrev[0], a*y + (1-a)*this.xPrev[1] ] : [x,y];
+    const xHat = (this.xPrev!=null)? a*x + (1-a)*this.xPrev : x;
     this.xPrev = xHat; return xHat;
   }
 }
-const filter = new OneEuro(1.0, 0.006, 1.0, 60);
+const filterX = new OneEuro(0.8, 0.003, 1.0, 60); // horizontal
+const filterY = new OneEuro(0.7, 0.002, 1.0, 60); // vertical slightly softer
 
 /* -------------------------------------------------------------
    7) CALIBRATION
@@ -432,8 +437,8 @@ const startCamera = async ()=>{
   proc.width = cam.videoWidth || 640;
   proc.height = cam.videoHeight || 480;
 
-  /* preview cuadrado interno para render nítido */
-  const side = 320;            // baja a 256 si quieres menos carga
+  /* internal square preview for crisp rendering */
+  const side = 320;
   preview.width  = side;
   preview.height = side;
 
@@ -495,13 +500,13 @@ function computeCombinedFeature(landmarks){
   let ux_head = (nose.x - eyeCenter.x)/eyeSpan;
   let uy_head = (nose.y - eyeCenter.y)/faceH;
   ux_head = -ux_head;
-  const ux = (1.4*ux_eye + 1.4*ux_head) * 8;
+  const ux = (1.4*ux_eye + 2*ux_head) * 8;
   const uy = (-1.4*uy_eye + 1.4*uy_head) * 6;
   return [ux, uy];
 }
 let BLINK_CONFIRM = false;
 let BLINK_LOW = 0.055, BLINK_HIGH = 0.085;
-const BLINK_MIN_MS=80, BLINK_MAX_MS=600, BLINK_COOLDOWN_MS=2000, BLINK_RANGE=380, EAR_FREEZE_XY=0.0950;
+const BLINK_MIN_MS=80, BLINK_MAX_MS=600, BLINK_COOLDOWN_MS=1000, BLINK_RANGE=380, EAR_FREEZE_XY=0.0950;
 let blinkState = { closed:false, t0:0, lastConfirm:0, cooldownUntil:0, justClosed:false };
 let pendingBlinkSelect = false, blinkCandidate = null;
 function computeEAR(lm){
@@ -520,11 +525,10 @@ function setBlinkCandidate(el){
   blinkCandidate = el;
   if (blinkCandidate) blinkCandidate.classList.add('candidate');
 }
-const filter1 = new OneEuro(1.0, 0.003, 1.0, 60);
 let lastU=[0,0], lastVideoTime=-1;
 
 /* -------------------------------------------------------------
-   11) EYE RINGS / IRIS INDICES (para los “rastreadores”)
+   11) EYE RINGS / IRIS INDICES (for the “trackers”)
    ------------------------------------------------------------- */
 const RIGHT_EYE_RING = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
 const LEFT_EYE_RING  = [362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398];
@@ -532,25 +536,23 @@ const RIGHT_IRIS = [469,470,471,472];
 const LEFT_IRIS  = [474,475,476,477];
 
 /* -------------------------------------------------------------
-   12) PREVIEW DRAW (video + trackers opcionales)
+   12) PREVIEW DRAW (video + optional trackers)
    ------------------------------------------------------------- */
-let lastResults = null; // guardamos el último resultado para el preview
+let lastResults = null; // save last result for preview
 
 function drawToPreview(){
   const vw = cam.videoWidth || 640, vh = cam.videoHeight || 480;
-  const cw = preview.width, ch = preview.height;   // cuadrado
-  const vr = vw / vh;                              // aspecto del video
-  const cr = cw / ch;                              // 1 (cuadrado)
+  const cw = preview.width, ch = preview.height;   // square
+  const vr = vw / vh;                              // video aspect
+  const cr = cw / ch;                              // 1 (square)
 
-  let sw, sh, sx, sy; // source rect (recorte tipo "cover")
+  let sw, sh, sx, sy; // source rect ("cover" crop)
   if (vr > cr){
-    // video más ancho → recorta laterales
     sh = vh;
     sw = sh * cr;
     sx = (vw - sw) / 2;
     sy = 0;
   } else {
-    // video más alto → recorta arriba/abajo
     sw = vw;
     sh = sw / cr;
     sx = 0;
@@ -559,54 +561,50 @@ function drawToPreview(){
 
   pctx.clearRect(0,0,cw,ch);
 
-  // espejo horizontal para selfie (pintamos todo dentro de este sistema)
+  // horizontal mirror for selfie
   pctx.save();
   pctx.translate(cw, 0);
   pctx.scale(-1, 1);
 
-  // 1) Dibuja el frame de cámara (recortado tipo cover)
+  // 1) Draw camera frame
   pctx.drawImage(cam, sx, sy, sw, sh, 0, 0, cw, ch);
 
-  // 2) Dibuja los rastreadores si hay landmarks
+  // 2) Trackers
   if (SHOW_EYE_TRACKERS && lastResults && lastResults.faceLandmarks && lastResults.faceLandmarks[0]){
     const lm = lastResults.faceLandmarks[0];
-
-    // helper: normalizado → coordenada en canvas teniendo en cuenta recorte
     const mapPt = (p) => {
-      const X = p.x * vw;               // coord en video original
-      const Y = p.y * vh;
-      const cx = (X - sx) * (cw / sw);  // aplica recorte y escala a canvas
+      const X = p.x * vw, Y = p.y * vh;
+      const cx = (X - sx) * (cw / sw);
       const cy = (Y - sy) * (ch / sh);
       return [cx, cy];
     };
-
-    // Párpados (anillo exterior)
     const rRing = RIGHT_EYE_RING.map(i => lm[i]).filter(Boolean).map(mapPt);
     const lRing = LEFT_EYE_RING .map(i => lm[i]).filter(Boolean).map(mapPt);
-
     pctx.globalAlpha = 0.95;
     drawPath(pctx, rRing, true, 2, '#7cc0ff');
     drawPath(pctx, lRing, true, 2, '#7cc0ff');
 
-    // Iris (si existen)
     const rIris = RIGHT_IRIS.map(i => lm[i]).filter(Boolean).map(mapPt);
     const lIris = LEFT_IRIS .map(i => lm[i]).filter(Boolean).map(mapPt);
-
     pctx.globalAlpha = 1.0;
     drawPath(pctx, rIris, true, 2, '#7CFF9C');
     drawPath(pctx, lIris, true, 2, '#7CFF9C');
-
-    // (Opcional) puntitos
-    // rIris.forEach(([x,y]) => drawPoint(pctx, x, y, 2.5, '#7CFF9C'));
-    // lIris.forEach(([x,y]) => drawPoint(pctx, x, y, 2.5, '#7CFF9C'));
   }
 
   pctx.restore();
 }
 
 /* -------------------------------------------------------------
-   13) MAIN LOOP
+   13) MAIN LOOP (with anti-jump on blink)
    ------------------------------------------------------------- */
+let holdPos = {x: innerWidth/2, y: innerHeight/2}; // position frozen during blink
+let unfreezeUntil = 0;                              // smooth exit from blink
+const UNFREEZE_MS = 160;                            // ramp duration
+const MAX_STEP_PX = 60;                             // jump cap per frame after blink
+
+function lerp(a,b,t){ return a + (b-a)*t; }
+function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
+
 async function tick(){
   ctx.drawImage(cam, 0, 0, proc.width, proc.height);
 
@@ -614,60 +612,99 @@ async function tick(){
   if (cam.currentTime !== lastVideoTime && faceLandmarker){
     lastVideoTime = cam.currentTime;
     const results = faceLandmarker.detectForVideo(cam, now);
-    lastResults = results; // ← guardamos para el preview
+    lastResults = results;
 
     if (results && results.faceLandmarks && results.faceLandmarks.length > 0){
       const lm = results.faceLandmarks[0];
 
       let u = computeCombinedFeature(lm);
-
       const ear = computeEAR(lm);
-      const t = now;
+
+      // --- Extra smoothing while eyelids are closing (reduces "u" contribution)
+      const earSoftLow = BLINK_LOW * 1.15;
+      const earSoftHigh = BLINK_HIGH;
+      const sEye = clamp((ear - earSoftLow) / (earSoftHigh - earSoftLow), 0, 1);
+      u = [ lastU[0] + (u[0]-lastU[0]) * sEye, lastU[1] + (u[1]-lastU[1]) * sEye ];
+
+      // --- Blink detection (same, but add anchor and smooth exit)
       if (!blinkState.closed && ear < BLINK_LOW) {
-        blinkState.closed = true; blinkState.t0 = t; blinkState.justClosed = true;
+        blinkState.closed = true;
+        blinkState.t0 = now;
+        blinkState.justClosed = true;
+        // Anchor current position (pre-filter after map) to freeze
+        const [ax, ay] = mapToScreen(lastU);
+        holdPos = {x: ax, y: ay};
       } else if (blinkState.closed && ear > BLINK_HIGH) {
-        const dur = t - blinkState.t0; blinkState.closed = false; blinkState.justClosed = false;
-        blinkState.cooldownUntil = t + BLINK_COOLDOWN_MS;
-        if (dur >= BLINK_MIN_MS && dur <= BLINK_MAX_MS &&
-            (t - blinkState.lastConfirm) > 450) {
+        const dur = now - blinkState.t0;
+        blinkState.closed = false; blinkState.justClosed = false;
+        blinkState.cooldownUntil = now + BLINK_COOLDOWN_MS;
+        unfreezeUntil = now + UNFREEZE_MS; // smooth exit
+        if (dur >= BLINK_MIN_MS && dur <= BLINK_MAX_MS && (now - blinkState.lastConfirm) > 450) {
           if (BLINK_CONFIRM) pendingBlinkSelect = true;
-          blinkState.lastConfirm = t;
+          blinkState.lastConfirm = now;
         }
       }
 
-      if (ear < EAR_FREEZE_XY || blinkState.closed || now < blinkState.cooldownUntil) {
+      // If blinking or in hard-freeze, keep previous feature
+      if (ear < EAR_FREEZE_XY || blinkState.closed){
         u = lastU.slice();
       }
       lastU = u;
 
       if (Number.isFinite(u[0]) && Number.isFinite(u[1])){
-        const [x,y] = mapToScreen(u);
-        const [xs,ys] = filter1.update([x,y]);
+        // map to screen
+        let [x,y] = mapToScreen(u);
 
-        if (Number.isFinite(xs) && Number.isFinite(ys)){
-          updateDwell(xs, ys);
+        // vertical OFFSET
+        y = clamp(y - GAZE_Y_LIFT_PX, 0, innerHeight);
 
-          // Blink-confirm opcional (si lo activas)
-          if (pendingBlinkSelect) {
-            const target = blinkCandidate || findNearestKey(xs, ys, BLINK_RANGE, true);
-            if (target) { selectKey(target); target.classList.remove('active'); }
-            setBlinkCandidate(null);
-            hoverKey = null; hoverStart = 0; setCursor(xs, ys, 0);
-            pendingBlinkSelect = false;
+        // separated FILTERS
+        let xs = filterX.update(x);
+        let ys = filterY.update(y);
+
+        // Smooth exit from blink (avoid aggressive drop)
+        if (now < unfreezeUntil){
+          const t = 1 - ((unfreezeUntil - now) / UNFREEZE_MS);
+          xs = lerp(holdPos.x, xs, t);
+          ys = lerp(holdPos.y, ys, t);
+        }
+
+        // Limit max step per frame right after blink
+        if (now - (unfreezeUntil - UNFREEZE_MS) < 250){ // ~250ms after blink
+          const dx = xs - holdPos.x, dy = ys - holdPos.y;
+          const d = Math.hypot(dx, dy);
+          if (d > MAX_STEP_PX){
+            const k = MAX_STEP_PX / d;
+            xs = holdPos.x + dx * k;
+            ys = holdPos.y + dy * k;
           }
-          if (blinkState.closed && blinkState.justClosed) {
-            const cand = findNearestKey(xs, ys, BLINK_RANGE, true);
-            setBlinkCandidate(cand);
-            blinkState.justClosed = false;
-          } else if (!blinkState.closed && now >= blinkState.cooldownUntil) {
-            setBlinkCandidate(null);
-          }
+        }
+
+        xs = clamp(xs, 0, innerWidth);
+        ys = clamp(ys, 0, innerHeight);
+
+        updateDwell(xs, ys);
+
+        // Optional blink-confirm
+        if (pendingBlinkSelect) {
+          const target = blinkCandidate || findNearestKey(xs, ys, BLINK_RANGE, true);
+          if (target) { selectKey(target); target.classList.remove('active'); }
+          setBlinkCandidate(null);
+          hoverKey = null; hoverStart = 0; setCursor(xs, ys, 0);
+          pendingBlinkSelect = false;
+        }
+        if (blinkState.closed && blinkState.justClosed) {
+          const cand = findNearestKey(xs, ys, BLINK_RANGE, true);
+          setBlinkCandidate(cand);
+          blinkState.justClosed = false;
+        } else if (!blinkState.closed && now >= blinkState.cooldownUntil) {
+          setBlinkCandidate(null);
         }
       }
     }
   }
 
-  /* dibuja preview (video + trackers si SHOW_EYE_TRACKERS) */
+  /* draw preview (video + trackers if SHOW_EYE_TRACKERS) */
   drawToPreview();
 
   requestAnimationFrame(tick);
@@ -699,15 +736,29 @@ window.addEventListener('keydown', e=>{
 });
 let previewVisible = true;
 window.addEventListener('keydown', e=>{
-  if(e.key.toLowerCase()==='v'){
+  const k = e.key.toLowerCase();
+  if(k==='v'){
     previewVisible = !previewVisible;
     document.getElementById('previewDock').style.display = previewVisible ? 'grid' : 'none';
   }
-  if(e.key.toLowerCase()==='t'){
+  if(k==='t'){
     SHOW_EYE_TRACKERS = !SHOW_EYE_TRACKERS;
     statTxt.textContent = SHOW_EYE_TRACKERS ? 'trackers ON' : 'trackers OFF';
+  }
+  // Fine-tune Y lift and persist
+  if(e.key === ']'){
+    GAZE_Y_LIFT_PX += 10;
+    localStorage.setItem('gazeYOffset', GAZE_Y_LIFT_PX);
+    statTxt.textContent = `Y lift: ${GAZE_Y_LIFT_PX}px`;
+  }
+  if(e.key === '['){
+    GAZE_Y_LIFT_PX = Math.max(0, GAZE_Y_LIFT_PX - 10);
+    localStorage.setItem('gazeYOffset', GAZE_Y_LIFT_PX);
+    statTxt.textContent = `Y lift: ${GAZE_Y_LIFT_PX}px`;
   }
 });
 </script>
 </body>
 </html>
+
+
