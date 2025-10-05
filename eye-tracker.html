@@ -4,44 +4,88 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Eye & Head Combined Gaze — MediaPipe Tasks FaceLandmarker</title>
+
 <style>
+  /* ------- THEME & LAYOUT ------- */
   :root{ --bg:#0b1220; --panel:#121a2a; --text:#e6eefb; --accent:#7cc0ff; --good:#7CFF9C; }
   html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-  #overlay{ position:fixed; inset:0; pointer-events:none; z-index:10020; }
+
+  /* Overlay hosts cursor + dwell ring visuals (not clickable) */
+  #overlay{ position:fixed; inset:0; pointer-events:none; z-index:9999; }
+
+  /* Gaze cursor + dwell progress ring */
   #cursor{ position:fixed; width:18px; height:18px; margin:-9px 0 0 -9px; border-radius:999px; background:var(--accent); box-shadow:0 0 0 4px rgba(124,192,255,.25); }
   #ring,#ringFill{ position:fixed; width:42px; height:42px; margin:-21px 0 0 -21px; border-radius:999px; }
-  #ring{border:3px solid rgba(255,255,255,.15)} #ringFill{box-shadow:0 0 0 3px var(--good) inset; clip-path: conic-gradient(var(--good) 0deg, transparent 0deg)}
+  #ring{border:3px solid rgba(255,255,255,.15)}
+  /* ringFill uses conic-gradient “clip-path” to draw a pie-progress for dwell */
+  #ringFill{box-shadow:0 0 0 3px var(--good) inset; clip-path: conic-gradient(var(--good) 0deg, transparent 0deg)}
+
+  /* Calibration target dots */
   .calibDot{ position:absolute; width:18px; height:18px; margin:-9px 0 0 -9px; border-radius:50%; background:#FFD37C; box-shadow:0 0 0 6px rgba(255,211,124,.2) }
+
+  /* On-screen keyboard grid (bottom dock) */
   #keyboard{ position:fixed; left:0; right:0; bottom:0; background:#0f172a; border-top:1px solid #1f2a42; display:grid; grid-template-columns:repeat(10,1fr); gap:8px; padding:12px; }
   .key{ user-select:none; display:flex; align-items:center; justify-content:center; height:56px; border-radius:12px; background:#16203a; color:#cfe3ff; border:1px solid #263a6b; font-weight:600 }
   .key.big{grid-column:span 2}.key.extra{grid-column:span 3}.key.active{outline:2px solid var(--accent)}
-  .key.candidate{ outline:2px dashed var(--good); } /* blink candidate highlight */
+  .key.candidate{ outline:2px dashed var(--good); } /* highlighted at blink “lock” */
+
+  /* Status pill (top-right) */
   #status{ position:fixed; right:12px; top:12px; background:#121a2a; border:1px solid #203059; padding:8px 10px; border-radius:8px; z-index:10000}
-  video,canvas{display:none}
-  /* typed output */
+
+  /* 🔁 Antes: video,canvas{display:none}
+     Ahora: ocultamos solo los nodos internos (cam/PROC), no el preview */
+  #cam,#proc{display:none}
+
+  /* Typed text display + caret */
   #typedBox{position:fixed; left:12px; right:12px; top:60px; background:#0f172a;
     border:1px solid #203059; padding:10px 12px; border-radius:10px; min-height:40px;
     font-size:18px; letter-spacing:.5px; white-space:pre-wrap; z-index:10000}
   #caret{opacity:.7; margin-left:2px; animation:blink .9s step-end infinite}
   @keyframes blink { 50% { opacity:0 } }
-  /* prediction bar */
+
+  /* Prediction bar (above keyboard) */
   #predictBar{ position:fixed; left:12px; right:12px; background:#0f172a; border:1px solid #203059;
     padding:8px; border-radius:10px; display:grid; grid-template-columns:repeat(3,1fr); gap:8px; z-index:10000 }
   #predictBar .key{ height:88px; font-weight:600; }
-  /* small button to enable sound */
+
+  /* Button to enable WebAudio beeps (required by some browsers) */
   #soundBtn{ position:fixed; left:12px; top:12px; z-index:10001; background:#16203a; color:#cfe3ff; border:1px solid #263a6b; border-radius:8px; padding:6px 10px; cursor:pointer }
+
+  /* ✅ PREVIEW centrado con el video + overlay de tracking */
+  #previewWrap{
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    pointer-events:none; z-index:2000; /* debajo del overlay de cursor */
+  }
+  #preview{
+    width:min(720px, 80vw);
+    height:40vh;
+    max-height: 40vh;
+    background:#020617;
+    border:1px solid #243b6b;
+    border-radius:12px;
+    box-shadow:0 10px 30px rgba(0,0,0,.35);
+  }
 </style>
 </head>
+
 <body>
+  <!-- Hidden media nodes: webcam feed + processing canvas -->
   <video id="cam" autoplay playsinline muted></video>
   <canvas id="proc" width="640" height="480"></canvas>
 
+  <!-- ✅ PREVIEW visible al centro -->
+  <div id="previewWrap">
+    <canvas id="preview" width="640" height="480"></canvas>
+  </div>
+
+  <!-- Visual overlay (cursor + dwell ring) -->
   <div id="overlay">
     <div id="cursor"></div>
     <div id="ring"></div>
     <div id="ringFill"></div>
   </div>
 
+  <!-- UI: predictions, keyboard, status, typed output, sound toggle -->
   <div id="predictBar" aria-label="Predictions"></div>
   <div id="keyboard"></div>
   <div id="status">Status: <span id="statTxt">loading model…</span></div>
@@ -49,9 +93,15 @@
   <button id="soundBtn" title="Enable Sound">🔊 sound</button>
 
 <script type="module">
+/* -------------------------------------------------------------
+   1) IMPORT MEDIAPIPE TASKS
+   ------------------------------------------------------------- */
 const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3');
 const { FaceLandmarker, FilesetResolver } = vision;
 
+/* -------------------------------------------------------------
+   2) DOM ELEMENT REFERENCES & TYPED BUFFER
+   ------------------------------------------------------------- */
 const cam = document.getElementById('cam');
 const proc = document.getElementById('proc');
 const ctx  = proc.getContext('2d');
@@ -64,9 +114,24 @@ const keyboard = document.getElementById('keyboard');
 const predictBar = document.getElementById('predictBar');
 const soundBtn = document.getElementById('soundBtn');
 const typedTextEl = document.getElementById('typedText');
+const preview = document.getElementById('preview');           // ✅
+const pctx = preview.getContext('2d');                        // ✅
 let typedBuffer = '';
 function renderTyped(){ typedTextEl.textContent = typedBuffer; }
 
+/* Helpers de dibujo (preview) ✅ */
+function drawPoint(ctx,x,y,r=4, color='#7cc0ff'){
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2);
+  ctx.fillStyle=color; ctx.fill();
+}
+function drawLine(ctx,x1,y1,x2,y2,w=2,color='#7cc0ff'){
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  ctx.lineWidth=w; ctx.strokeStyle=color; ctx.stroke();
+}
+
+/* -------------------------------------------------------------
+   3) KEYBOARD LAYOUT & CONSTRUCTION
+   ------------------------------------------------------------- */
 const LAYOUT = ['QWERTYUIOP','ASDFGHJKL','ZXCVBNM'];
 function buildKeyboard(){
   keyboard.innerHTML='';
@@ -78,18 +143,22 @@ function buildKeyboard(){
   addKey('SPACE','extra'); addKey('BKSP','big'); addKey('ENTER','big');
   positionPredictBar();
 }
-function addKey(label, cls=''){ const d=document.createElement('div'); d.className='key '+cls; d.dataset.label=label; d.textContent=label; keyboard.appendChild(d); }
+function addKey(label, cls=''){
+  const d=document.createElement('div');
+  d.className='key '+cls;
+  d.dataset.label=label;
+  d.textContent=label;
+  keyboard.appendChild(d);
+}
 buildKeyboard();
 
+/* Small helpers */
 const wait = ms=>new Promise(r=>setTimeout(r,ms));
 
-const COMMON_WORDS = [
-  "the","to","and","you","that","was","for","are","with","have","this","not","but","they","his","her","she","from","had","say","who",
-  "about","would","there","their","what","when","which","can","more","if","do","will","so","no","we","one","all","out","up","as",
-  "on","in","at","it","is","be","of","or","by","an","he","me","my","your","our","like","time","just","know","good","people","now",
-  "new","into","over","back","only","other","than","first","day","how","make","take","look","use","work","even","want","because",
-  "any","could","should","very","also","between","after","before","again","little","great","right","left","top","bottom","yes","no"
-];
+/* -------------------------------------------------------------
+   4) LIGHTWEIGHT NEXT-WORD SUGGESTIONS (STATIC COMMON WORDS)
+   ------------------------------------------------------------- */
+const COMMON_WORDS = [ /* …trimmed list… */ "yes","no" ];
 function positionPredictBar(){
   const kbRect = keyboard.getBoundingClientRect();
   const bottomOffset = window.innerHeight - kbRect.top + 8;
@@ -104,12 +173,9 @@ function lastToken(){
 function updatePredictions(){
   predictBar.innerHTML = '';
   const token = lastToken().toLowerCase();
-  let picks = [];
-  if (token.length >= 1){
-    picks = COMMON_WORDS.filter(w=>w.startsWith(token)).slice(0,3);
-  } else {
-    picks = COMMON_WORDS.slice(0,3);
-  }
+  const picks = token.length >= 1
+    ? COMMON_WORDS.filter(w=>w.startsWith(token)).slice(0,3)
+    : COMMON_WORDS.slice(0,3);
   for(const w of picks){
     const el = document.createElement('div');
     el.className = 'key pred';
@@ -120,6 +186,9 @@ function updatePredictions(){
   }
 }
 
+/* -------------------------------------------------------------
+   5) OPTIONAL AUDIO FEEDBACK (KEY/WORD BEEPS)
+   ------------------------------------------------------------- */
 let audioCtx = null;
 soundBtn.addEventListener('click', ()=>{
   try{
@@ -133,8 +202,7 @@ function beep(freq=660, dur=0.06, vol=0.06){
   const t0 = audioCtx.currentTime;
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();
-  osc.frequency.value = freq;
-  osc.type = 'sine';
+  osc.frequency.value = freq; osc.type = 'sine';
   gain.gain.setValueAtTime(0, t0);
   gain.gain.linearRampToValueAtTime(vol, t0+0.005);
   gain.gain.exponentialRampToValueAtTime(0.0001, t0+dur);
@@ -144,10 +212,24 @@ function beep(freq=660, dur=0.06, vol=0.06){
 function keyClickSound(){ beep(720, 0.06, 0.07); }
 function wordClickSound(){ beep(480, 0.10, 0.09); }
 
-/* ---------- dwell + snapping ---------- */
-const DWELL_MS = 500;
-const SNAP_RADIUS = 44;                 // easier acquire (was 28)
+/* -------------------------------------------------------------
+   6) DWELL SELECCIÓN + SNAP (con estabilidad y antirrebote)
+   ------------------------------------------------------------- */
+const DWELL_MS = 2000;
+const ENABLE_DWELL_SELECT = true;
+const DWELL_STABILITY_PX = 24;
+const DWELL_RESET_DRIFT_PX = 36;
+const DWELL_COOLDOWN_MS = 600;
+
+let dwellCooldownUntil = 0;
+let dwellAnchor = null;
+
 let hoverKey=null, hoverStart=0;
+
+const SNAP_RADIUS = 20;
+const MAGNET_RADIUS_KEY  = 80;
+const MAGNET_RADIUS_WORD = 140;
+const RELEASE_FACTOR     = 1.6;
 
 function centerDist(el, x, y){
   const r = el.getBoundingClientRect();
@@ -166,21 +248,14 @@ function findNearestKey(x,y, R, biasWords=true){
   }
   return (R==null || bestRaw<=R) ? best : null;
 }
-const MAGNET_RADIUS_KEY  = 100;   // was 100
-const MAGNET_RADIUS_WORD = 180;   // was 180
-const RELEASE_FACTOR     = 1.5;  // was 1.5
-const USE_DWELL = false;          // blink-only click; keep highlight
-const CLICK_DIST_KEY  = 100;  // px
-const CLICK_DIST_WORD = 160;  // px
 let snappedEl = null;
-
 function snapPoint(x, y){
   let cand = findNearestKey(x, y, null, true);
   let resultX = x, resultY = y;
   if (snappedEl){
     const {d:sd} = centerDist(snappedEl, x, y);
     const sRad = (snappedEl.dataset.type==='word') ? MAGNET_RADIUS_WORD : MAGNET_RADIUS_KEY;
-    if (sd > sRad * RELEASE_FACTOR) snappedEl = null; else cand = snappedEl;
+    if (sd > sRad * RELEASE_FACTOR){ snappedEl = null; } else { cand = snappedEl; }
   }
   if (!snappedEl && cand){
     const {cx, cy, d} = centerDist(cand, x, y);
@@ -193,7 +268,6 @@ function snapPoint(x, y){
   }
   return { sx: resultX, sy: resultY, el: snappedEl || cand };
 }
-
 function selectKey(k){
   const isWord = k.dataset.type === 'word';
   const label = k.dataset.label;
@@ -201,53 +275,65 @@ function selectKey(k){
     const m = typedBuffer.match(/^(.*?)([A-Za-z]+)?$/s);
     const head = m ? (m[1] || '') : typedBuffer;
     typedBuffer = head + label + ' ';
-    renderTyped(); updatePredictions(); wordClickSound();
-    statTxt.textContent = `Word: ${label}`;
+    renderTyped(); updatePredictions();
+    statTxt.textContent = `Word: ${label}`; wordClickSound();
     return;
   }
-  if (label === 'SPACE')      { typedBuffer += ' '; statTxt.textContent = 'Inserted: ␣'; }
+  if (label === 'SPACE')      { typedBuffer += ' ';   statTxt.textContent = 'Inserted: ␣'; }
   else if (label === 'BKSP')  { typedBuffer = typedBuffer.slice(0, -1); statTxt.textContent = 'Backspace ⌫'; }
-  else if (label === 'ENTER') { typedBuffer += '\n'; statTxt.textContent = 'Inserted: ↵'; }
+  else if (label === 'ENTER') { typedBuffer += '\n';  statTxt.textContent = 'Inserted: ↵'; }
   else                        { typedBuffer += label; statTxt.textContent = `Inserted: ${label}`; }
   renderTyped(); updatePredictions(); keyClickSound();
 }
 function setCursor(x,y,p=0){
   cursor.style.left=x+'px'; cursor.style.top=y+'px';
-  ring.style.left=x+'px'; ring.style.top=y+'px';
+  ring.style.left=x+'px';   ring.style.top=y+'px';
   ringFill.style.left=x+'px'; ringFill.style.top=y+'px';
   ringFill.style.clipPath = `conic-gradient(var(--good) ${Math.round(p*360)}deg, transparent 0deg)`;
 }
 function updateDwell(xs, ys){
-  const  sx = xs, sy = ys;
-  const candidate = findNearestKey(sx, sy, null, true);
-  const isClose  = candidate ? (centerDist(candidate, sx, sy).d <= SNAP_RADIUS) : false;
-  const nearest  = isClose ? candidate : null;
-
+  const { sx, sy } = snapPoint(xs, ys);
+  const nearest = findNearestKey(sx, sy, SNAP_RADIUS, true);
   if (nearest !== hoverKey){
     if(hoverKey) hoverKey.classList.remove('active');
-    hoverKey = candidate;                          // always highlight current candidate
-    hoverStart = isClose ? performance.now() : 0;  // dwell only if close
+    hoverKey   = nearest;
+    hoverStart = nearest ? performance.now() : 0;
+    dwellAnchor = nearest ? { x: sx, y: sy } : null;
     setCursor(sx, sy, 0);
     if(hoverKey) hoverKey.classList.add('active');
     return;
   }
   if (!hoverKey) { setCursor(sx, sy, 0); return; }
-
-  const p = isClose ? Math.min(1, (performance.now()-hoverStart)/DWELL_MS) : 0;
+  const drift = dwellAnchor ? Math.hypot(sx - dwellAnchor.x, sy - dwellAnchor.y) : Infinity;
+  if (drift > DWELL_RESET_DRIFT_PX) {
+    dwellAnchor = { x: sx, y: sy };
+    hoverStart  = performance.now();
+    setCursor(sx, sy, 0);
+    return;
+  }
+  const now = performance.now();
+  const allowProgress = (drift <= DWELL_STABILITY_PX) && (now >= dwellCooldownUntil);
+  const p = allowProgress ? Math.min(1, (now - hoverStart) / DWELL_MS) : 0;
   setCursor(sx, sy, p);
-
-  if (p >= 1 && USE_DWELL){
-    selectKey(hoverKey);
-    hoverKey.classList.remove('active');
-    hoverKey = null; hoverStart = 0;
+  if (p >= 1) {
+    if (ENABLE_DWELL_SELECT) {
+      selectKey(hoverKey);
+      dwellCooldownUntil = performance.now() + DWELL_COOLDOWN_MS;
+    } else {
+      setBlinkCandidate(hoverKey);
+    }
+    hoverKey?.classList.remove('active');
+    hoverKey = null; hoverStart = 0; dwellAnchor = null;
     setCursor(sx, sy, 0);
   }
 }
 
-/* ---------- OneEuro filter ---------- */
+/* -------------------------------------------------------------
+   7) ONE EURO FILTER
+   ------------------------------------------------------------- */
 class OneEuro {
   constructor(minCutoff=1.0, beta=0.006, dCutoff=1.0, freq=60){
-    this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=dCutoff; this.freq=freq;
+    this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=1.0; this.freq=freq;
     this.xPrev=null; this.dxPrev=0; this.tPrev=null;
   }
   alpha(cutoff){ const te=1.0/this.freq; const r=2*Math.PI*cutoff*te; return r/(r+1); }
@@ -265,7 +351,9 @@ class OneEuro {
 }
 const filter = new OneEuro(1.0, 0.006, 1.0, 60);
 
-/* ---------- calibration ---------- */
+/* -------------------------------------------------------------
+   8) CALIBRATION (quadratic mapping from feature space → screen)
+   ------------------------------------------------------------- */
 const calibPairs=[];
 const targets=[[0.1,0.1],[0.5,0.1],[0.9,0.1],[0.1,0.5],[0.5,0.5],[0.9,0.5],[0.1,0.9],[0.5,0.9],[0.9,0.9]];
 const margin=40;
@@ -278,8 +366,8 @@ function showDotAt(tx,ty){
   return {x,y,el:d};
 }
 let theta=null;
-let uBias = JSON.parse(localStorage.getItem('uBias') || '[0,0]');
 const phi = ([a,b])=> [1,a,b,a*a,a*b,b*b];
+
 function fitMapping(pairs){
   const Phi=pairs.map(p=>phi(p.u)), Y=pairs.map(p=>p.v);
   const d=6, m=Phi.length, A=Array.from({length:d},()=>Array(d).fill(0)), B=Array.from({length:d},()=>Array(2).fill(0));
@@ -289,12 +377,17 @@ function fitMapping(pairs){
     for(let i=0;i<n;i++){ let piv=i; for(let r=i+1;r<n;r++) if(Math.abs(M[r][i])>Math.abs(M[piv][i])) piv=r;
       [M[i],M[piv]]=[M[piv],M[i]]; const div=M[i][i]||1e-9; for(let c=i;c<=n;c++) M[i][c]/=div;
       for(let r=0;r<n;r++){ if(r===i) continue; const f=M[r][i]; for(let c=i;c<=n;c++) M[r][c]-=f*M[i][c]; } }
-  return M.map(row=>row[n]); }
-  theta=[solve(0), solve(1)]; localStorage.setItem('calibTheta', JSON.stringify(theta));
+    return M.map(row=>row[n]); }
+  theta=[solve(0), solve(1)];
+  localStorage.setItem('calibTheta', JSON.stringify(theta));
 }
 function mapToScreen(u){
-  if(!theta){ const cx=innerWidth*0.5, cy=innerHeight*0.5; return [cx + u[0]*220, cy + u[1]*220]; }
-  const p=phi(u); const x=p.reduce((s,v,i)=>s+v*theta[0][i],0), y=p.reduce((s,v,i)=>s+v*theta[1][i],0); return [x,y];
+  if(!theta){
+    const cx=innerWidth*0.5, cy=innerHeight*0.5; return [cx + u[0]*220, cy + u[1]*220];
+  }
+  const p=phi(u);
+  const x=p.reduce((s,v,i)=>s+v*theta[0][i],0), y=p.reduce((s,v,i)=>s+v*theta[1][i],0);
+  return [x,y];
 }
 async function runCalibration(){
   statTxt.textContent='calibrating…';
@@ -304,10 +397,15 @@ async function runCalibration(){
     for(let i=0;i<S;i++){ if(lastU) calibPairs.push({u:lastU.slice(), v:[dot.x,dot.y]}); await wait(dt); }
     dot.el.remove(); await wait(120);
   }
-  fitMapping(calibPairs); statTxt.textContent='running (calibrated ✓)'; localStorage.setItem('calibrated','1');
+  fitMapping(calibPairs);
+  statTxt.textContent='running (calibrated ✓)';
+  localStorage.setItem('calibrated','1');
 }
+window.addEventListener('keydown', e=>{ if(e.key==='c') runCalibration(); });
 
-/* ---------- camera ---------- */
+/* -------------------------------------------------------------
+   9) CAMERA SETUP (hidden video → canvas)
+   ------------------------------------------------------------- */
 const constraints = { video: { facingMode: 'user', width: 640, height: 480 } };
 const startCamera = async ()=>{
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -323,10 +421,17 @@ const startCamera = async ()=>{
   cam.style.transform='scaleX(-1)';
   proc.width = cam.videoWidth || 640;
   proc.height = cam.videoHeight || 480;
+
+  /* ✅ Ajusta preview al tamaño real del video */
+  preview.width  = cam.videoWidth  || 640;
+  preview.height = cam.videoHeight || 480;
+
   console.log('video dims:', cam.videoWidth, cam.videoHeight);
 };
 
-/* ---------- face landmarker ---------- */
+/* -------------------------------------------------------------
+   10) LOAD MEDIAPIPE FACE LANDMARKER (WASM + GPU DELEGATE)
+   ------------------------------------------------------------- */
 let faceLandmarker=null, runningMode='VIDEO';
 async function loadLandmarker(){
   const filesetResolver = await FilesetResolver.forVisionTasks(
@@ -344,7 +449,9 @@ async function loadLandmarker(){
   });
 }
 
-/* ---------- gaze feature ---------- */
+/* -------------------------------------------------------------
+   11) LANDMARK INDEXES + FEATURE ENGINEERING
+   ------------------------------------------------------------- */
 const IDX = {
   R_OUT: 33, R_IN: 133, L_OUT: 362, L_IN: 263,
   R_UP: 159, R_LO: 145, L_UP: 386, L_LO: 374,
@@ -360,62 +467,52 @@ function computeCombinedFeature(landmarks){
   const N = landmarks.length;
   const Rc = (N>=478) ? avgPts(landmarks, IDX.RIGHT_IRIS) : avgPts(landmarks, [IDX.R_UP, IDX.R_LO]);
   const Lc = (N>=478) ? avgPts(landmarks, IDX.LEFT_IRIS)  : avgPts(landmarks, [IDX.L_UP, IDX.L_LO]);
-
   const Router = landmarks[IDX.R_OUT], Rinner = landmarks[IDX.R_IN];
   const Louter = landmarks[IDX.L_OUT], Linner = landmarks[IDX.L_IN];
   const Rmid = {x:(Router.x+Rinner.x)/2, y:(Router.y+Rinner.y)/2};
   const Lmid = {x:(Louter.x+Linner.x)/2, y:(Louter.y+Linner.y)/2};
   const Rw = Math.hypot(Router.x-Rinner.x, Router.y-Rinner.y) + 1e-6;
   const Lw = Math.hypot(Louter.x-Linner.x, Louter.y-Linner.y) + 1e-6;
-
   const Rup = landmarks[IDX.R_UP], Rlo = landmarks[IDX.R_LO];
   const Lup = landmarks[IDX.L_UP], Llo = landmarks[IDX.L_LO];
   const RmidY = (Rup.y + Rlo.y)/2, LmidY = (Lup.y + Llo.y)/2;
   const Rh_raw = Math.abs(Rup.y - Rlo.y);
   const Lh_raw = Math.abs(Lup.y - Llo.y);
-  const Rh = Math.max(Rh_raw, 0.25*Rw) + 1e-6; // robust near blink
+  const Rh = Math.max(Rh_raw, 0.25*Rw) + 1e-6;
   const Lh = Math.max(Lh_raw, 0.25*Lw) + 1e-6;
-
   const ux_eye = -((Rc.x - Rmid.x)/Rw + (Lc.x - Lmid.x)/Lw) * 0.5;
   const uy_eye = ((Rc.y - RmidY)/Rh + (Lc.y - LmidY)/Lh) * 0.5;
-
   const REc = {x:(Router.x+Rinner.x)/2, y:(Router.y+Rinner.y)/2};
   const LEc = {x:(Louter.x+Linner.x)/2, y:(Louter.y+Linner.y)/2};
   const eyeCenter = {x:(REc.x+LEc.x)/2, y:(REc.y+LEc.y)/2};
-
   let minY=+Infinity, maxY=-Infinity, minX=+Infinity, maxX=-Infinity;
   for(const p of landmarks){ if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y; if(p.x<minX)minX=p.x; if(p.x>maxX)maxX=p.x; }
   const faceH = Math.max(1e-6, maxY - minY);
   const eyeSpan = Math.hypot(REc.x-LEc.x, REc.y-LEc.y) + 1e-6;
-
   const nose = landmarks[IDX.NOSE] || eyeCenter;
   let ux_head = (nose.x - eyeCenter.x)/eyeSpan;
   let uy_head = (nose.y - eyeCenter.y)/faceH;
   ux_head = -ux_head;
-
   const ux = (1.4*ux_eye + 1.4*ux_head) * 8;
   const uy = (-1.4*uy_eye + 1.4*uy_head) * 6;
   return [ux, uy];
 }
 
-/* ---------- blink (dynamic thresholds + derivative freeze) ---------- */
-let BLINK_CONFIRM = true;
-let BLINK_LOW_BASE  = 0.045;
-let BLINK_HIGH_BASE = 0.085;
+/* -------------------------------------------------------------
+   12) BLINK DETECTION & BLINK-TO-CLICK
+   ------------------------------------------------------------- */
+let BLINK_CONFIRM = false;
+let BLINK_LOW = 0.055;
+let BLINK_HIGH = 0.085;
 const BLINK_MIN_MS = 80;
 const BLINK_MAX_MS = 600;
-const BLINK_COOLDOWN_MS = 500;
-const BLINK_RANGE = 120;
+const BLINK_COOLDOWN_MS = 2000;
+const BLINK_RANGE = 380;
+const EAR_FREEZE_XY = 0.0950;
 
 let blinkState = { closed:false, t0:0, lastConfirm:0, cooldownUntil:0, justClosed:false };
 let pendingBlinkSelect = false;
 let blinkCandidate = null;
-let earBelowFrames = 0, earAboveFrames = 0;
-const ENTER_FRAMES = 2, EXIT_FRAMES = 2;
-
-let prevEar = null;
-let earOpenEMA = 0;
-const EAR_DROP_FREEZE = 0.020;   // freeze on fast closing
 
 function computeEAR(lm){
   const R_OUT=33, R_IN=133, R_UP=159, R_LO=145;
@@ -434,155 +531,151 @@ function setBlinkCandidate(el){
   blinkCandidate = el;
   if (blinkCandidate) blinkCandidate.classList.add('candidate');
 }
-
-/* ---------- main loop ---------- */
 const filter1 = new OneEuro(1.0, 0.003, 1.0, 60);
 let lastU=[0,0], lastVideoTime=-1;
-let lastSnapEl = null;
 
+/* -------------------------------------------------------------
+   13) MAIN LOOP
+   ------------------------------------------------------------- */
 async function tick(){
   ctx.drawImage(cam, 0, 0, proc.width, proc.height);
+
   const now = performance.now();
   if (cam.currentTime !== lastVideoTime && faceLandmarker){
     lastVideoTime = cam.currentTime;
     const results = faceLandmarker.detectForVideo(cam, now);
 
-    if (results?.faceLandmarks?.length){
+    if (results && results.faceLandmarks && results.faceLandmarks.length > 0){
       const lm = results.faceLandmarks[0];
+
       let u = computeCombinedFeature(lm);
 
-      // EAR + dynamic thresholds
       const ear = computeEAR(lm);
-      if (!blinkState.closed && ear > BLINK_HIGH_BASE) {
-        earOpenEMA = earOpenEMA ? (0.9*earOpenEMA + 0.1*ear) : ear;
-      }
-      const BLINK_LOW_EFF  = Math.max(BLINK_LOW_BASE,  earOpenEMA ? earOpenEMA*0.62 : BLINK_LOW_BASE);
-      const BLINK_HIGH_EFF = Math.max(BLINK_HIGH_BASE, BLINK_LOW_EFF + 0.015);
-      const EAR_FREEZE_EFF = BLINK_LOW_EFF + 0.020;
-
-      // pre-blink derivative freeze to prevent jump
-      if (prevEar !== null && (prevEar - ear) > EAR_DROP_FREEZE) {
-        u = lastU.slice();
-      }
-
-      // Debounced blink FSM
       const t = now;
-      if (!blinkState.closed) {
-        if (ear < BLINK_LOW_EFF) {
-          if (++earBelowFrames >= ENTER_FRAMES) {
-            blinkState.closed = true; blinkState.t0 = t; blinkState.justClosed = true; earAboveFrames = 0;
-          }
-        } else earBelowFrames = 0;
-      } else {
-        if (ear > BLINK_HIGH_EFF) {
-          if (++earAboveFrames >= EXIT_FRAMES) {
-            const dur = t - blinkState.t0;
-            blinkState.closed = false; blinkState.justClosed = false;
-            blinkState.cooldownUntil = t + BLINK_COOLDOWN_MS;
-            if (dur >= BLINK_MIN_MS && dur <= BLINK_MAX_MS && (t - blinkState.lastConfirm) > 400) {
-              if (BLINK_CONFIRM) pendingBlinkSelect = true;
-              blinkState.lastConfirm = t;
-            }
-            earBelowFrames = 0;
-          }
-        } else earAboveFrames = 0;
+      if (!blinkState.closed && ear < BLINK_LOW) {
+        blinkState.closed = true; blinkState.t0 = t; blinkState.justClosed = true;
+      } else if (blinkState.closed && ear > BLINK_HIGH) {
+        const dur = t - blinkState.t0; blinkState.closed = false; blinkState.justClosed = false;
+        blinkState.cooldownUntil = t + BLINK_COOLDOWN_MS;
+        if (dur >= BLINK_MIN_MS && dur <= BLINK_MAX_MS &&
+            (t - blinkState.lastConfirm) > 450) {
+          if (BLINK_CONFIRM) pendingBlinkSelect = true;
+          blinkState.lastConfirm = t;
+        }
       }
 
-      // Freeze during near-close/closed/cooldown
-      if (ear < EAR_FREEZE_EFF || blinkState.closed || now < blinkState.cooldownUntil) {
+      if (ear < EAR_FREEZE_XY || blinkState.closed || now < blinkState.cooldownUntil) {
         u = lastU.slice();
       }
       lastU = u;
-      prevEar = ear;
 
       if (Number.isFinite(u[0]) && Number.isFinite(u[1])){
-        const [x,y]   = mapToScreen(u);
+        const [x,y] = mapToScreen(u);
         const [xs,ys] = filter1.update([x,y]);
+
         if (Number.isFinite(xs) && Number.isFinite(ys)){
-          const snap = snapPoint(xs, ys);
-          const { sx, sy, el } = snap;
-          lastSnapEl = el;
+          // Dwell + cursor UI
+          updateDwell(xs, ys);
 
-          setCursor(sx, sy, hoverKey ? Math.min(1, (performance.now()-hoverStart)/DWELL_MS) : 0);
-          updateDwell(sx, sy);
+          /* ---------- ✅ PREVIEW: cámara + landmarks + punto de mirada ---------- */
 
-          // Lock candidate at blink start to the *pre-blink* element
+          // limpiar
+          pctx.clearRect(0,0,preview.width,preview.height);
+
+          // dibujar video espejado
+          pctx.save();
+          pctx.translate(preview.width, 0);
+          pctx.scale(-1, 1);
+          pctx.drawImage(cam, 0, 0, preview.width, preview.height);
+          pctx.restore();
+
+          // helper: normalizado (x,y) → píxeles de preview
+          const V2P = (pt)=> [ pt.x * preview.width, pt.y * preview.height ];
+
+          // Párpados/comisuras de cada ojo
+          const R_OUT=33, R_IN=133, R_UP=159, R_LO=145;
+          const L_OUT=362, L_IN=263, L_UP=386, L_LO=374;
+
+          const rPts = [lm[R_OUT], lm[R_IN], lm[R_UP], lm[R_LO]].filter(Boolean);
+          const lPts = [lm[L_OUT], lm[L_IN], lm[L_UP], lm[L_LO]].filter(Boolean);
+
+          pctx.globalAlpha = 0.9;
+          for(const p of rPts){ const [px,py] = V2P(p); drawPoint(pctx,px,py,3,'#7cc0ff'); }
+          for(const p of lPts){ const [px,py] = V2P(p); drawPoint(pctx,px,py,3,'#7cc0ff'); }
+
+          // Iris si existen
+          const RIGHT_IRIS = [469,470,471,472], LEFT_IRIS = [474,475,476,477];
+          const rIris = RIGHT_IRIS.map(i=>lm[i]).filter(Boolean);
+          const lIris = LEFT_IRIS.map(i=>lm[i]).filter(Boolean);
+          pctx.globalAlpha = 1.0;
+          for(const p of rIris){ const [px,py] = V2P(p); drawPoint(pctx,px,py,2.5,'#7CFF9C'); }
+          for(const p of lIris){ const [px,py] = V2P(p); drawPoint(pctx,px,py,2.5,'#7CFF9C'); }
+
+          // Punto de mirada: xs,ys están en coords de pantalla → escálalos a preview
+          const gx = (xs / innerWidth)  * preview.width;
+          const gy = (ys / innerHeight) * preview.height;
+
+          // cruz + circulito
+          drawLine(pctx, gx-10, gy, gx+10, gy, 2, '#FFD37C');
+          drawLine(pctx, gx, gy-10, gx, gy+10, 2, '#FFD37C');
+          drawPoint(pctx, gx, gy, 4, '#FFD37C');
+
+          /* --------------------------------------------------------------------- */
+
+          // Blink-confirm opcional
+          if (pendingBlinkSelect) {
+            const target = blinkCandidate || findNearestKey(xs, ys, BLINK_RANGE, true);
+            if (target) { selectKey(target); target.classList.remove('active'); }
+            setBlinkCandidate(null);
+            hoverKey = null; hoverStart = 0; setCursor(xs, ys, 0);
+            pendingBlinkSelect = false;
+          }
           if (blinkState.closed && blinkState.justClosed) {
-            setBlinkCandidate(lastSnapEl || findNearestKey(sx, sy, BLINK_RANGE, true));
+            const cand = findNearestKey(xs, ys, BLINK_RANGE, true);
+            setBlinkCandidate(cand);
             blinkState.justClosed = false;
           } else if (!blinkState.closed && now >= blinkState.cooldownUntil) {
             setBlinkCandidate(null);
           }
-
-          if (pendingBlinkSelect) {
-            const candidate = blinkCandidate || findNearestKey(sx, sy, null, true);
-            let ok = false;
-
-            if (candidate) {
-                const { d } = centerDist(candidate, sx, sy);
-                const thresh = candidate.dataset.type === 'word' ? CLICK_DIST_WORD : CLICK_DIST_KEY;
-                ok = d <= thresh;
-            }
-
-            if (ok) {
-                selectKey(candidate);
-                candidate.classList.remove('active');
-            } else {
-                // too far → no click
-                statTxt.textContent = 'blink ignored (too far)';
-            }
-
-            setBlinkCandidate(null);
-            hoverKey = null; hoverStart = 0; setCursor(sx, sy, 0);
-            pendingBlinkSelect = false;
-            }
         }
       }
     }
   }
+
   requestAnimationFrame(tick);
 }
 
-/* ---------- boot ---------- */
+/* -------------------------------------------------------------
+   14) BOOTSTRAP
+   ------------------------------------------------------------- */
 async function boot(){
   await startCamera();
   statTxt.textContent='loading face landmarker…';
   await loadLandmarker();
   statTxt.textContent='running';
   const saved = localStorage.getItem('calibTheta');
-  if(saved){
-    try{
-      const t = JSON.parse(saved);
-      const ok = t && t.length===2 && t[0].every(Number.isFinite) && t[1].every(Number.isFinite);
-      if (ok) { theta = t; statTxt.textContent='running (calibrated ✓)'; }
-      else { localStorage.removeItem('calibTheta'); theta=null; }
-    }catch{ localStorage.removeItem('calibTheta'); theta=null; }
-  }
+  if(saved){ try{ theta = JSON.parse(saved); statTxt.textContent='running (calibrated ✓)'; }catch{} }
   updatePredictions();
-  requestAnimationFrame(() => {
-    setCursor(window.innerWidth/2, window.innerHeight/2, 0);
-  });
   requestAnimationFrame(tick);
 }
 boot();
 
-/* ---------- hotkeys ---------- */
-// c = calibration; r = recenter; x = clear calibration
+// Shortcuts
 window.addEventListener('keydown', e=>{ if(e.key==='c') runCalibration(); });
-window.addEventListener('keydown', (e) => {
-  if (e.key === 'r') {
-    if (Array.isArray(lastU)) {
-      uBias = lastU.slice();
-      localStorage.setItem('uBias', JSON.stringify(uBias));
-      statTxt.textContent = 'recentered (baseline set)';
-    }
-  }
-});
 window.addEventListener('keydown', e=>{
   if (e.key==='x'){
     localStorage.removeItem('calibTheta');
     theta = null;
     statTxt.textContent = 'calibration cleared';
+  }
+});
+
+/* (Opcional) toggle rápido del preview con tecla 'v' */
+let previewVisible = true;
+window.addEventListener('keydown', e=>{
+  if(e.key.toLowerCase()==='v'){
+    previewVisible = !previewVisible;
+    document.getElementById('previewWrap').style.display = previewVisible ? 'flex' : 'none';
   }
 });
 </script>
