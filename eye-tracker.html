@@ -7,7 +7,7 @@
 <style>
   :root{ --bg:#0b1220; --panel:#121a2a; --text:#e6eefb; --accent:#7cc0ff; --good:#7CFF9C; }
   html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-  #overlay{ position:fixed; inset:0; pointer-events:none; z-index:9999; }
+  #overlay{ position:fixed; inset:0; pointer-events:none; z-index:10020; }
   #cursor{ position:fixed; width:18px; height:18px; margin:-9px 0 0 -9px; border-radius:999px; background:var(--accent); box-shadow:0 0 0 4px rgba(124,192,255,.25); }
   #ring,#ringFill{ position:fixed; width:42px; height:42px; margin:-21px 0 0 -21px; border-radius:999px; }
   #ring{border:3px solid rgba(255,255,255,.15)} #ringFill{box-shadow:0 0 0 3px var(--good) inset; clip-path: conic-gradient(var(--good) 0deg, transparent 0deg)}
@@ -144,9 +144,10 @@ function beep(freq=660, dur=0.06, vol=0.06){
 function keyClickSound(){ beep(720, 0.06, 0.07); }
 function wordClickSound(){ beep(480, 0.10, 0.09); }
 
-const DWELL_MS = 500, SNAP_RADIUS = 28;
+/* ---------- dwell + snapping ---------- */
+const DWELL_MS = 500;
+const SNAP_RADIUS = 44;                 // easier acquire (was 28)
 let hoverKey=null, hoverStart=0;
-
 
 function centerDist(el, x, y){
   const r = el.getBoundingClientRect();
@@ -154,7 +155,6 @@ function centerDist(el, x, y){
   const d = Math.hypot(x-cx, y-cy);
   return {cx, cy, d};
 }
-
 function findNearestKey(x,y, R, biasWords=true){
   let best=null, bestScore=Infinity, bestRaw=Infinity;
   const els = document.querySelectorAll('.key');
@@ -166,91 +166,77 @@ function findNearestKey(x,y, R, biasWords=true){
   }
   return (R==null || bestRaw<=R) ? best : null;
 }
-
-const MAGNET_RADIUS_KEY  = 100;  // px
-const MAGNET_RADIUS_WORD = 180;  // px (words easier)
-const RELEASE_FACTOR     = 1.5;  // must move this many radii to release
+const MAGNET_RADIUS_KEY  = 100;   // was 100
+const MAGNET_RADIUS_WORD = 180;   // was 180
+const RELEASE_FACTOR     = 1.5;  // was 1.5
+const USE_DWELL = false;          // blink-only click; keep highlight
+const CLICK_DIST_KEY  = 100;  // px
+const CLICK_DIST_WORD = 160;  // px
 let snappedEl = null;
 
 function snapPoint(x, y){
-  // choose candidate (biased towards words)
   let cand = findNearestKey(x, y, null, true);
   let resultX = x, resultY = y;
-
-  // If already snapped, prefer staying unless we moved far away
   if (snappedEl){
-    const {cx:scx, cy:scy, d:sd} = centerDist(snappedEl, x, y);
+    const {d:sd} = centerDist(snappedEl, x, y);
     const sRad = (snappedEl.dataset.type==='word') ? MAGNET_RADIUS_WORD : MAGNET_RADIUS_KEY;
-    // release only if we went far beyond
-    if (sd > sRad * RELEASE_FACTOR){
-      snappedEl = null; // release
-    } else {
-      cand = snappedEl; // keep current snap
-    }
+    if (sd > sRad * RELEASE_FACTOR) snappedEl = null; else cand = snappedEl;
   }
-
   if (!snappedEl && cand){
     const {cx, cy, d} = centerDist(cand, x, y);
     const rad = (cand.dataset.type==='word') ? MAGNET_RADIUS_WORD : MAGNET_RADIUS_KEY;
-    if (d <= rad){
-      snappedEl = cand;
-      resultX = cx; resultY = cy;
-    }
+    if (d <= rad){ snappedEl = cand; resultX = cx; resultY = cy; }
   }
-
   if (snappedEl){
     const {cx, cy} = centerDist(snappedEl, x, y);
     resultX = cx; resultY = cy;
   }
-
   return { sx: resultX, sy: resultY, el: snappedEl || cand };
 }
 
 function selectKey(k){
   const isWord = k.dataset.type === 'word';
   const label = k.dataset.label;
-
   if (isWord){
     const m = typedBuffer.match(/^(.*?)([A-Za-z]+)?$/s);
     const head = m ? (m[1] || '') : typedBuffer;
     typedBuffer = head + label + ' ';
-    renderTyped();
-    updatePredictions();
+    renderTyped(); updatePredictions(); wordClickSound();
     statTxt.textContent = `Word: ${label}`;
-    wordClickSound();
     return;
   }
-
   if (label === 'SPACE')      { typedBuffer += ' '; statTxt.textContent = 'Inserted: ␣'; }
   else if (label === 'BKSP')  { typedBuffer = typedBuffer.slice(0, -1); statTxt.textContent = 'Backspace ⌫'; }
   else if (label === 'ENTER') { typedBuffer += '\n'; statTxt.textContent = 'Inserted: ↵'; }
   else                        { typedBuffer += label; statTxt.textContent = `Inserted: ${label}`; }
-  renderTyped();
-  updatePredictions();
-  keyClickSound();
+  renderTyped(); updatePredictions(); keyClickSound();
 }
-
 function setCursor(x,y,p=0){
   cursor.style.left=x+'px'; cursor.style.top=y+'px';
   ring.style.left=x+'px'; ring.style.top=y+'px';
   ringFill.style.left=x+'px'; ringFill.style.top=y+'px';
   ringFill.style.clipPath = `conic-gradient(var(--good) ${Math.round(p*360)}deg, transparent 0deg)`;
 }
-
 function updateDwell(xs, ys){
-  const { sx, sy } = snapPoint(xs, ys);
-  const nearest = findNearestKey(sx, sy, SNAP_RADIUS, true);
+  const  sx = xs, sy = ys;
+  const candidate = findNearestKey(sx, sy, null, true);
+  const isClose  = candidate ? (centerDist(candidate, sx, sy).d <= SNAP_RADIUS) : false;
+  const nearest  = isClose ? candidate : null;
+
   if (nearest !== hoverKey){
     if(hoverKey) hoverKey.classList.remove('active');
-    hoverKey = nearest; hoverStart = nearest ? performance.now() : 0;
+    hoverKey = candidate;                          // always highlight current candidate
+    hoverStart = isClose ? performance.now() : 0;  // dwell only if close
     setCursor(sx, sy, 0);
     if(hoverKey) hoverKey.classList.add('active');
     return;
   }
   if (!hoverKey) { setCursor(sx, sy, 0); return; }
-  const p = Math.min(1, (performance.now()-hoverStart)/DWELL_MS);
+
+  const p = isClose ? Math.min(1, (performance.now()-hoverStart)/DWELL_MS) : 0;
   setCursor(sx, sy, p);
-  if (p >= 1){
+
+  if (p >= 1 && USE_DWELL){
     selectKey(hoverKey);
     hoverKey.classList.remove('active');
     hoverKey = null; hoverStart = 0;
@@ -258,6 +244,7 @@ function updateDwell(xs, ys){
   }
 }
 
+/* ---------- OneEuro filter ---------- */
 class OneEuro {
   constructor(minCutoff=1.0, beta=0.006, dCutoff=1.0, freq=60){
     this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=dCutoff; this.freq=freq;
@@ -278,6 +265,7 @@ class OneEuro {
 }
 const filter = new OneEuro(1.0, 0.006, 1.0, 60);
 
+/* ---------- calibration ---------- */
 const calibPairs=[];
 const targets=[[0.1,0.1],[0.5,0.1],[0.9,0.1],[0.1,0.5],[0.5,0.5],[0.9,0.5],[0.1,0.9],[0.5,0.9],[0.9,0.9]];
 const margin=40;
@@ -290,6 +278,7 @@ function showDotAt(tx,ty){
   return {x,y,el:d};
 }
 let theta=null;
+let uBias = JSON.parse(localStorage.getItem('uBias') || '[0,0]');
 const phi = ([a,b])=> [1,a,b,a*a,a*b,b*b];
 function fitMapping(pairs){
   const Phi=pairs.map(p=>phi(p.u)), Y=pairs.map(p=>p.v);
@@ -317,8 +306,8 @@ async function runCalibration(){
   }
   fitMapping(calibPairs); statTxt.textContent='running (calibrated ✓)'; localStorage.setItem('calibrated','1');
 }
-window.addEventListener('keydown', e=>{ if(e.key==='c') runCalibration(); });
 
+/* ---------- camera ---------- */
 const constraints = { video: { facingMode: 'user', width: 640, height: 480 } };
 const startCamera = async ()=>{
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -337,6 +326,7 @@ const startCamera = async ()=>{
   console.log('video dims:', cam.videoWidth, cam.videoHeight);
 };
 
+/* ---------- face landmarker ---------- */
 let faceLandmarker=null, runningMode='VIDEO';
 async function loadLandmarker(){
   const filesetResolver = await FilesetResolver.forVisionTasks(
@@ -354,6 +344,7 @@ async function loadLandmarker(){
   });
 }
 
+/* ---------- gaze feature ---------- */
 const IDX = {
   R_OUT: 33, R_IN: 133, L_OUT: 362, L_IN: 263,
   R_UP: 159, R_LO: 145, L_UP: 386, L_LO: 374,
@@ -367,7 +358,6 @@ function avgPts(landmarks, idxs){
 }
 function computeCombinedFeature(landmarks){
   const N = landmarks.length;
-
   const Rc = (N>=478) ? avgPts(landmarks, IDX.RIGHT_IRIS) : avgPts(landmarks, [IDX.R_UP, IDX.R_LO]);
   const Lc = (N>=478) ? avgPts(landmarks, IDX.LEFT_IRIS)  : avgPts(landmarks, [IDX.L_UP, IDX.L_LO]);
 
@@ -383,7 +373,7 @@ function computeCombinedFeature(landmarks){
   const RmidY = (Rup.y + Rlo.y)/2, LmidY = (Lup.y + Llo.y)/2;
   const Rh_raw = Math.abs(Rup.y - Rlo.y);
   const Lh_raw = Math.abs(Lup.y - Llo.y);
-  const Rh = Math.max(Rh_raw, 0.25*Rw) + 1e-6;
+  const Rh = Math.max(Rh_raw, 0.25*Rw) + 1e-6; // robust near blink
   const Lh = Math.max(Lh_raw, 0.25*Lw) + 1e-6;
 
   const ux_eye = -((Rc.x - Rmid.x)/Rw + (Lc.x - Lmid.x)/Lw) * 0.5;
@@ -408,18 +398,24 @@ function computeCombinedFeature(landmarks){
   return [ux, uy];
 }
 
+/* ---------- blink (dynamic thresholds + derivative freeze) ---------- */
 let BLINK_CONFIRM = true;
-let BLINK_LOW = 0.055;
-let BLINK_HIGH = 0.085;
+let BLINK_LOW_BASE  = 0.045;
+let BLINK_HIGH_BASE = 0.085;
 const BLINK_MIN_MS = 80;
 const BLINK_MAX_MS = 600;
-const BLINK_COOLDOWN_MS = 2000;
-const BLINK_RANGE = 380;
-const EAR_FREEZE_XY = 0.0950;
+const BLINK_COOLDOWN_MS = 500;
+const BLINK_RANGE = 120;
 
 let blinkState = { closed:false, t0:0, lastConfirm:0, cooldownUntil:0, justClosed:false };
 let pendingBlinkSelect = false;
 let blinkCandidate = null;
+let earBelowFrames = 0, earAboveFrames = 0;
+const ENTER_FRAMES = 2, EXIT_FRAMES = 2;
+
+let prevEar = null;
+let earOpenEMA = 0;
+const EAR_DROP_FREEZE = 0.020;   // freeze on fast closing
 
 function computeEAR(lm){
   const R_OUT=33, R_IN=133, R_UP=159, R_LO=145;
@@ -438,95 +434,157 @@ function setBlinkCandidate(el){
   blinkCandidate = el;
   if (blinkCandidate) blinkCandidate.classList.add('candidate');
 }
+
+/* ---------- main loop ---------- */
 const filter1 = new OneEuro(1.0, 0.003, 1.0, 60);
 let lastU=[0,0], lastVideoTime=-1;
+let lastSnapEl = null;
 
 async function tick(){
   ctx.drawImage(cam, 0, 0, proc.width, proc.height);
-
   const now = performance.now();
   if (cam.currentTime !== lastVideoTime && faceLandmarker){
     lastVideoTime = cam.currentTime;
     const results = faceLandmarker.detectForVideo(cam, now);
 
-    if (results && results.faceLandmarks && results.faceLandmarks.length > 0){
+    if (results?.faceLandmarks?.length){
       const lm = results.faceLandmarks[0];
-
       let u = computeCombinedFeature(lm);
 
-      // Blink state
+      // EAR + dynamic thresholds
       const ear = computeEAR(lm);
-      const t = now;
-      if (!blinkState.closed && ear < BLINK_LOW) {
-        blinkState.closed = true; blinkState.t0 = t; blinkState.justClosed = true;
-      } else if (blinkState.closed && ear > BLINK_HIGH) {
-        const dur = t - blinkState.t0; blinkState.closed = false; blinkState.justClosed = false;
-        blinkState.cooldownUntil = t + BLINK_COOLDOWN_MS;
-        if (dur >= BLINK_MIN_MS && dur <= BLINK_MAX_MS &&
-            (t - blinkState.lastConfirm) > 450) {
-          if (BLINK_CONFIRM) pendingBlinkSelect = true;
-          blinkState.lastConfirm = t;
-        }
+      if (!blinkState.closed && ear > BLINK_HIGH_BASE) {
+        earOpenEMA = earOpenEMA ? (0.9*earOpenEMA + 0.1*ear) : ear;
+      }
+      const BLINK_LOW_EFF  = Math.max(BLINK_LOW_BASE,  earOpenEMA ? earOpenEMA*0.62 : BLINK_LOW_BASE);
+      const BLINK_HIGH_EFF = Math.max(BLINK_HIGH_BASE, BLINK_LOW_EFF + 0.015);
+      const EAR_FREEZE_EFF = BLINK_LOW_EFF + 0.020;
+
+      // pre-blink derivative freeze to prevent jump
+      if (prevEar !== null && (prevEar - ear) > EAR_DROP_FREEZE) {
+        u = lastU.slice();
       }
 
-      // Freeze during pre-blink, closed, and cooldown
-      if (ear < EAR_FREEZE_XY || blinkState.closed || now < blinkState.cooldownUntil) {
+      // Debounced blink FSM
+      const t = now;
+      if (!blinkState.closed) {
+        if (ear < BLINK_LOW_EFF) {
+          if (++earBelowFrames >= ENTER_FRAMES) {
+            blinkState.closed = true; blinkState.t0 = t; blinkState.justClosed = true; earAboveFrames = 0;
+          }
+        } else earBelowFrames = 0;
+      } else {
+        if (ear > BLINK_HIGH_EFF) {
+          if (++earAboveFrames >= EXIT_FRAMES) {
+            const dur = t - blinkState.t0;
+            blinkState.closed = false; blinkState.justClosed = false;
+            blinkState.cooldownUntil = t + BLINK_COOLDOWN_MS;
+            if (dur >= BLINK_MIN_MS && dur <= BLINK_MAX_MS && (t - blinkState.lastConfirm) > 400) {
+              if (BLINK_CONFIRM) pendingBlinkSelect = true;
+              blinkState.lastConfirm = t;
+            }
+            earBelowFrames = 0;
+          }
+        } else earAboveFrames = 0;
+      }
+
+      // Freeze during near-close/closed/cooldown
+      if (ear < EAR_FREEZE_EFF || blinkState.closed || now < blinkState.cooldownUntil) {
         u = lastU.slice();
       }
       lastU = u;
+      prevEar = ear;
 
       if (Number.isFinite(u[0]) && Number.isFinite(u[1])){
-        const [x,y] = mapToScreen(u);
+        const [x,y]   = mapToScreen(u);
         const [xs,ys] = filter1.update([x,y]);
-
         if (Number.isFinite(xs) && Number.isFinite(ys)){
-          // ⬅ NEW: compute snapped location first
-          const { sx, sy } = snapPoint(xs, ys);
-          setCursor(sx, sy, hoverKey ? Math.min(1, (performance.now()-hoverStart)/DWELL_MS) : 0);
+          const snap = snapPoint(xs, ys);
+          const { sx, sy, el } = snap;
+          lastSnapEl = el;
 
-          // Regular dwell hover at snapped location
+          setCursor(sx, sy, hoverKey ? Math.min(1, (performance.now()-hoverStart)/DWELL_MS) : 0);
           updateDwell(sx, sy);
 
-          // Lock blink candidate at blink start (use snapped position)
+          // Lock candidate at blink start to the *pre-blink* element
           if (blinkState.closed && blinkState.justClosed) {
-            const cand = findNearestKey(sx, sy, BLINK_RANGE, true);
-            setBlinkCandidate(cand);
+            setBlinkCandidate(lastSnapEl || findNearestKey(sx, sy, BLINK_RANGE, true));
             blinkState.justClosed = false;
           } else if (!blinkState.closed && now >= blinkState.cooldownUntil) {
             setBlinkCandidate(null);
           }
 
-          // Blink release selects candidate (word or key)
           if (pendingBlinkSelect) {
-            const target = blinkCandidate || findNearestKey(sx, sy, BLINK_RANGE, true);
-            if (target) { selectKey(target); target.classList.remove('active'); }
+            const candidate = blinkCandidate || findNearestKey(sx, sy, null, true);
+            let ok = false;
+
+            if (candidate) {
+                const { d } = centerDist(candidate, sx, sy);
+                const thresh = candidate.dataset.type === 'word' ? CLICK_DIST_WORD : CLICK_DIST_KEY;
+                ok = d <= thresh;
+            }
+
+            if (ok) {
+                selectKey(candidate);
+                candidate.classList.remove('active');
+            } else {
+                // too far → no click
+                statTxt.textContent = 'blink ignored (too far)';
+            }
+
             setBlinkCandidate(null);
             hoverKey = null; hoverStart = 0; setCursor(sx, sy, 0);
             pendingBlinkSelect = false;
-          }
+            }
         }
       }
     }
   }
-
   requestAnimationFrame(tick);
 }
 
+/* ---------- boot ---------- */
 async function boot(){
   await startCamera();
   statTxt.textContent='loading face landmarker…';
   await loadLandmarker();
   statTxt.textContent='running';
   const saved = localStorage.getItem('calibTheta');
-  if(saved){ try{ theta = JSON.parse(saved); statTxt.textContent='running (calibrated ✓)'; }catch{} }
+  if(saved){
+    try{
+      const t = JSON.parse(saved);
+      const ok = t && t.length===2 && t[0].every(Number.isFinite) && t[1].every(Number.isFinite);
+      if (ok) { theta = t; statTxt.textContent='running (calibrated ✓)'; }
+      else { localStorage.removeItem('calibTheta'); theta=null; }
+    }catch{ localStorage.removeItem('calibTheta'); theta=null; }
+  }
   updatePredictions();
+  requestAnimationFrame(() => {
+    setCursor(window.innerWidth/2, window.innerHeight/2, 0);
+  });
   requestAnimationFrame(tick);
 }
 boot();
 
-// Quick key to recalibrate
+/* ---------- hotkeys ---------- */
+// c = calibration; r = recenter; x = clear calibration
 window.addEventListener('keydown', e=>{ if(e.key==='c') runCalibration(); });
-
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'r') {
+    if (Array.isArray(lastU)) {
+      uBias = lastU.slice();
+      localStorage.setItem('uBias', JSON.stringify(uBias));
+      statTxt.textContent = 'recentered (baseline set)';
+    }
+  }
+});
+window.addEventListener('keydown', e=>{
+  if (e.key==='x'){
+    localStorage.removeItem('calibTheta');
+    theta = null;
+    statTxt.textContent = 'calibration cleared';
+  }
+});
 </script>
 </body>
 </html>
