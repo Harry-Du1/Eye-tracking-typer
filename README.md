@@ -153,7 +153,7 @@ Aditya Raj	@adityaraj457
 Jose Feliz Cuevas	---------
 
 🧾 Quick Summary
-git clone https://github.com/adityaraj457/VisionKeys.git
+git clone https://github.com/Harry-Du1/Eye-tracking-typer
 cd VisionKeys
 python -m http.server 8000
 # Open http://localhost:8000
