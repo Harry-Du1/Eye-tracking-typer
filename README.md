@@ -1,6 +1,5 @@
 # VisionKeys — HackHarvard 2025
 
-Repository: adityaraj457/VisionKeys
 Event: HackHarvard 2025
 Authors: Harry Du, Aditya Raj, Jose Feliz Cuevas
 Tagline: VisionKeys — an eye and head-controlled typing interface designed to give everyone the power to communicate hands-free.
